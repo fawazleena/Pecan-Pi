@@ -1,0 +1,1 @@
+alert icmp any any -> any any (msg:"PECAN PI TEST - ping detected"; itype:8; sid:9000001; rev:2;)
