@@ -1,4 +1,5 @@
-import json, os, time
+import json, os, time, sqlite3
+from datetime import datetime, timezone
 from dotenv import load_dotenv
 from groq import Groq
 
@@ -6,32 +7,63 @@ load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
 MODEL = "openai/gpt-oss-120b"
 EVE = "/var/log/suricata/eve.json"
+DB = "pecan.db"
 BATCH_SECONDS = 30
-IGNORE_SIDS = {9000001}  # our ping test rule
+IGNORE_SIDS = {9000001}  # ping test rule
 
 CONTEXT = (
     "Environment: the local host is a Kali Linux security appliance on a home "
     "network. It regularly runs apt updates from official Kali mirrors."
 )
 
-def triage(batch):
-    items = []
-    for (sid, src, dst), (e, count) in batch.items():
-        slim = {k: e.get(k) for k in ("src_ip", "dest_ip", "dest_port", "proto", "app_proto", "http", "tls", "dns")}
-        slim.update(sid=sid, signature=e["alert"]["signature"],
-                    severity=e["alert"]["severity"], count=count)
-        items.append(slim)
+db = sqlite3.connect(DB)
+db.execute("""CREATE TABLE IF NOT EXISTS alerts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    seen_at TEXT, sid INTEGER, signature TEXT, severity INTEGER,
+    src_ip TEXT, dest_ip TEXT, count INTEGER,
+    verdict TEXT, priority TEXT, reason TEXT)""")
+db.commit()
+
+def triage(items):
     prompt = (
         "You are a SOC analyst triaging grouped Suricata alerts.\n" + CONTEXT + "\n"
         "Suricata severity: 1 = highest, 3 = lowest. 'count' = times seen in this window.\n"
         "Use every field plus general knowledge of well-known domains and software. "
         "Do not invent facts.\n"
-        "For EACH alert output exactly one line:\n"
-        "sid | verdict (benign/suspicious/malicious) | priority (low/medium/high) | short reason\n\n"
-        + json.dumps(items)
+        "For EACH alert output exactly one line, nothing else:\n"
+        "n | verdict (benign/suspicious/malicious) | priority (low/medium/high) | short reason\n"
+        "where n is the alert's 'n' field.\n\n" + json.dumps(items)
     )
     r = client.chat.completions.create(model=MODEL, messages=[{"role": "user", "content": prompt}])
-    return r.choices[0].message.content
+    results = {}
+    for line in r.choices[0].message.content.splitlines():
+        parts = [p.strip() for p in line.split("|")]
+        if len(parts) >= 4 and parts[0].isdigit():
+            results[int(parts[0])] = (parts[1].lower(), parts[2].lower(), parts[3])
+    return results
+
+def flush(pending):
+    items = []
+    for n, (key, (e, count)) in enumerate(pending.items()):
+        slim = {k: e.get(k) for k in ("src_ip", "dest_ip", "dest_port", "proto", "app_proto", "http", "tls", "dns")}
+        slim.update(n=n, sid=key[0], signature=e["alert"]["signature"],
+                    severity=e["alert"]["severity"], count=count)
+        items.append(slim)
+    try:
+        results = triage(items)
+    except Exception as err:
+        print("AI error:", err)
+        results = {}
+    now = datetime.now(timezone.utc).isoformat()
+    for it in items:
+        verdict, priority, reason = results.get(it["n"], ("unknown", "unknown", "AI unavailable"))
+        db.execute(
+            "INSERT INTO alerts (seen_at, sid, signature, severity, src_ip, dest_ip, count, verdict, priority, reason) "
+            "VALUES (?,?,?,?,?,?,?,?,?,?)",
+            (now, it["sid"], it["signature"], it["severity"], it["src_ip"], it["dest_ip"],
+             it["count"], verdict, priority, reason))
+        print(f"[{priority:>7}] {verdict:<10} {it['signature']} x{it['count']} | {reason}")
+    db.commit()
 
 pending, last_flush = {}, time.time()
 print("Pecan Pi pipeline running...")
@@ -51,9 +83,5 @@ with open(EVE) as f:
         else:
             time.sleep(0.5)
         if pending and time.time() - last_flush >= BATCH_SECONDS:
-            print(f"\n--- {len(pending)} unique alert(s) ---")
-            try:
-                print(triage(pending))
-            except Exception as err:
-                print("AI error:", err)
+            flush(pending)
             pending, last_flush = {}, time.time()
