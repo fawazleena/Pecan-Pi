@@ -17,6 +17,9 @@ There is no build, lint, or test suite. Scripts run directly with the venv inter
 .venv/bin/python alerts.py        # tail eve.json and print alerts, no AI
 .venv/bin/python tui.py         # Textual dashboard: service status + latest 50 alerts (read-only DB, run as normal user)
 .venv/bin/python anomaly.py snapshot --since 2026-10-05   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
+nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Forest -> anomaly_model.joblib
+.venv/bin/python anomaly.py eval FILE.jsonl               # score a flow file with the live code path
+.venv/bin/python make_replay.py SNAPSHOT --pi <pi-ip> --peer <laptop-ip> --out-dir replay   # offline attack replays (no network traffic)
 ```
 
 `GROQ_API_KEY` is read from `.env` (gitignored) via `load_dotenv()`.
@@ -59,6 +62,11 @@ The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-o
 ## Anomaly detection (`anomaly.py`, in progress)
 
 Isolation Forest on Suricata `flow` events, as a second detector next to signatures. Phases: collect baseline -> `snapshot` -> train -> live scoring inside `pipeline.py`. Broadcast/multicast destinations are excluded in both training and scoring (`is_broadcast_or_multicast`), since that chatter depends on which network the Pi is on.
+
+- 13 features per flow (`FEATURES`): per-flow size/packets/duration/port class/protocol, plus what the same source did in the last 60s (flows, distinct ports, distinct hosts, unanswered fraction). Training, replay and live scoring share `SourceWindow`, so features are computed identically.
+- Threshold = false-positive budget (`--fp-budget`, default 2%) on the newest 20% of the baseline, held out from fitting. Attack replays are never used to set it; they are only evaluated with `eval`. Isolation Forest cannot score points beyond the training range as stranger than the most extreme baseline flow, which is why a 0.5% threshold caught nothing.
+- Anomalies are grouped per source IP (a sweep across many hosts is one row).
+- Test attacks only with `make_replay.py` + `eval` during baseline collection: no live scans until the baseline snapshot is taken.
 
 The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd timer, every ~10 min, `Nice=19`) generates benign DNS lookups, a few HTTPS fetches, and apt update every 6h. **The baseline is therefore partly synthetic**; say so in the thesis. Do not scan or test during the baseline window.
 
