@@ -12,6 +12,7 @@ REFRESH_SECONDS = 5
 LIMIT = 50
 ROW_STYLE = {"high": "bold red", "medium": "yellow", "low": "dim"}
 COLUMNS = ("Time", "Priority", "Verdict", "Signature", "Src -> Dst", "Count", "Reason")
+REASON_WIDTH = 40  # table shows a truncated reason; the detail panel shows it in full
 
 
 def service_states():
@@ -28,11 +29,16 @@ def query(hide_benign):
         counts = dict(db.execute("SELECT verdict, COUNT(*) FROM alerts GROUP BY verdict"))
         where = "WHERE verdict != 'benign'" if hide_benign else ""
         rows = db.execute(
-            "SELECT seen_at, priority, verdict, signature, src_ip, dest_ip, count, reason "
+            "SELECT id, seen_at, priority, verdict, signature, src_ip, dest_ip, count, reason "
             f"FROM alerts {where} ORDER BY id DESC LIMIT ?", (LIMIT,)).fetchall()
     finally:
         db.close()
     return counts, rows
+
+
+def shorten(text, width):
+    text = str(text)
+    return text if len(text) <= width else text[:width - 1] + "…"
 
 
 def local_time(iso):
@@ -44,14 +50,20 @@ def local_time(iso):
 
 class PecanTUI(App):
     TITLE = "Pecan Pi"
-    CSS = "#status { height: 1; padding: 0 1; background: $panel; } DataTable { height: 1fr; }"
+    CSS = """
+    #status { height: 1; padding: 0 1; background: $panel; }
+    DataTable { height: 1fr; }
+    #detail { height: auto; max-height: 10; padding: 0 1; border-top: solid $accent; }
+    """
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"), ("f", "toggle_benign", "Hide benign")]
 
     hide_benign = False
+    details = {}  # row key (DB id) -> (signature, src, dst, reason) for the detail panel
 
     def compose(self):
         yield Static("Loading...", id="status")
         yield DataTable(cursor_type="row", zebra_stripes=False)
+        yield Static("", id="detail")
         yield Footer()
 
     def on_mount(self):
@@ -90,11 +102,41 @@ class PecanTUI(App):
         self.query_one("#status", Static).update(status)
 
         table = self.query_one(DataTable)
+        # clear() resets the cursor to the top, so remember which alert was highlighted.
+        selected = self.highlighted_key(table)
         table.clear()
-        for seen_at, priority, verdict, sig, src, dst, count, reason in rows:
+        self.details = {}
+        for alert_id, seen_at, priority, verdict, sig, src, dst, count, reason in rows:
+            key = str(alert_id)
+            self.details[key] = (sig, src, dst, reason)
             style = ROW_STYLE.get(priority, "")
-            cells = (local_time(seen_at), priority, verdict, sig, f"{src} -> {dst}", str(count), reason)
-            table.add_row(*(Text(str(c), style=style) for c in cells))
+            cells = (local_time(seen_at), priority, verdict, sig, f"{src} -> {dst}", str(count),
+                     shorten(reason, REASON_WIDTH))
+            table.add_row(*(Text(str(c), style=style) for c in cells), key=key)
+        if selected in self.details:
+            table.move_cursor(row=table.get_row_index(selected))
+        self.show_detail(self.highlighted_key(table))
+
+    def highlighted_key(self, table):
+        if not table.row_count:
+            return None
+        return table.coordinate_to_cell_key(table.cursor_coordinate).row_key.value
+
+    def on_data_table_row_highlighted(self, event):
+        self.show_detail(event.row_key.value)
+
+    def show_detail(self, key):
+        detail = self.query_one("#detail", Static)
+        if key not in self.details:
+            detail.update(Text("No alert selected", style="dim"))
+            return
+        sig, src, dst, reason = self.details[key]
+        text = Text()
+        for label, value in (("Signature", sig), ("Src -> Dst", f"{src} -> {dst}"), ("Reason", reason)):
+            text.append(f"{label}: ", style="bold")
+            text.append(f"{value}\n")
+        text.rstrip()
+        detail.update(text)
 
 
 if __name__ == "__main__":
