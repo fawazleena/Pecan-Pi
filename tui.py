@@ -11,8 +11,9 @@ SERVICES = ("suricata", "pecan-pipeline")
 REFRESH_SECONDS = 5
 LIMIT = 50
 ROW_STYLE = {"high": "bold red", "medium": "yellow", "low": "dim"}
-COLUMNS = ("Time", "Priority", "Verdict", "Signature", "Src -> Dst", "Count", "Reason")
-REASON_WIDTH = 40  # table shows a truncated reason; the detail panel shows it in full
+COLUMNS = ("Time", "Type", "Priority", "Verdict", "Signature", "Src -> Dst", "Count", "Reason")
+REASON_WIDTH = 40     # table shows truncated text; the detail panel shows it in full
+SIGNATURE_WIDTH = 60  # anomaly summaries are long
 
 
 def service_states():
@@ -29,7 +30,7 @@ def query(hide_benign):
         counts = dict(db.execute("SELECT verdict, COUNT(*) FROM alerts GROUP BY verdict"))
         where = "WHERE verdict != 'benign'" if hide_benign else ""
         rows = db.execute(
-            "SELECT id, seen_at, priority, verdict, signature, src_ip, dest_ip, count, reason "
+            "SELECT id, seen_at, detection, score, priority, verdict, signature, src_ip, dest_ip, count, reason "
             f"FROM alerts {where} ORDER BY id DESC LIMIT ?", (LIMIT,)).fetchall()
     finally:
         db.close()
@@ -58,7 +59,7 @@ class PecanTUI(App):
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"), ("f", "toggle_benign", "Hide benign")]
 
     hide_benign = False
-    details = {}  # row key (DB id) -> (signature, src, dst, reason) for the detail panel
+    details = {}  # row key (DB id) -> (detection, score, signature, src, dst, reason) for the detail panel
 
     def compose(self):
         yield Static("Loading...", id="status")
@@ -106,12 +107,12 @@ class PecanTUI(App):
         selected = self.highlighted_key(table)
         table.clear()
         self.details = {}
-        for alert_id, seen_at, priority, verdict, sig, src, dst, count, reason in rows:
+        for alert_id, seen_at, detection, score, priority, verdict, sig, src, dst, count, reason in rows:
             key = str(alert_id)
-            self.details[key] = (sig, src, dst, reason)
+            self.details[key] = (detection, score, sig, src, dst, reason)
             style = ROW_STYLE.get(priority, "")
-            cells = (local_time(seen_at), priority, verdict, sig, f"{src} -> {dst}", str(count),
-                     shorten(reason, REASON_WIDTH))
+            cells = (local_time(seen_at), detection, priority, verdict, shorten(sig, SIGNATURE_WIDTH),
+                     f"{src} -> {dst}", str(count), shorten(reason, REASON_WIDTH))
             table.add_row(*(Text(str(c), style=style) for c in cells), key=key)
         if selected in self.details:
             table.move_cursor(row=table.get_row_index(selected))
@@ -130,9 +131,11 @@ class PecanTUI(App):
         if key not in self.details:
             detail.update(Text("No alert selected", style="dim"))
             return
-        sig, src, dst, reason = self.details[key]
+        detection, score, sig, src, dst, reason = self.details[key]
         text = Text()
-        for label, value in (("Signature", sig), ("Src -> Dst", f"{src} -> {dst}"), ("Reason", reason)):
+        kind = detection if score is None else f"{detection} (Isolation Forest score {score})"
+        for label, value in (("Type", kind), ("Signature", sig), ("Src -> Dst", f"{src} -> {dst}"),
+                             ("Reason", reason)):
             text.append(f"{label}: ", style="bold")
             text.append(f"{value}\n")
         text.rstrip()
