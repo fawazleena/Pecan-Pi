@@ -1,0 +1,9 @@
+{
+  "label": "Example values for a small organization, configurable",
+  "assets": [
+    {"name": "Internet gateway / router", "rto": "4 hours", "rpo": "n/a (stores no business data)"},
+    {"name": "Workstations and user devices", "rto": "8 hours", "rpo": "24 hours"},
+    {"name": "File storage / shared data", "rto": "24 hours", "rpo": "24 hours"},
+    {"name": "Pecan Pi monitoring appliance", "rto": "24 hours", "rpo": "7 days (alert history)"}
+  ]
+}

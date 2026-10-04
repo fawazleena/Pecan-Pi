@@ -15,6 +15,7 @@ There is no build, lint, or test suite. Scripts run directly with the venv inter
 .venv/bin/python test_groq.py     # sanity-check GROQ_API_KEY by listing available Groq models
 .venv/bin/python analyze.py       # one-shot: triage the most recent real alert in eve.json
 .venv/bin/python alerts.py        # tail eve.json and print alerts, no AI
+nice -n 19 .venv/bin/python report.py --since 2026-10-01 [--until ...] [--no-ai]   # PDF report -> reports/ (gitignored)
 sudo .venv/bin/python backfill.py  # re-triage 'AI unavailable' rows (--dry-run: no API calls/writes)
 .venv/bin/python tui.py         # Textual dashboard: service status + latest 50 alerts (read-only DB, run as normal user)
 .venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
@@ -63,6 +64,15 @@ The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-o
 - Tailscale started 2026-10-04T22:23, before the anomaly baseline (22:32): its STUN/DERP flows are part of the baseline. Keep it running, and say so in the thesis.
 
 `analyze.py` and `alerts.py` are earlier prototypes of the same flow, kept as standalone debugging tools.
+
+## Reporting (`report.py`)
+
+PDF for a time range (`--since`/`--until`, local time, compared against `seen_at` in UTC), rendered with WeasyPrint + Jinja2 (Kali system packages, no pip). Reads `pecan.db` read-only, so it runs as a normal user next to the pipeline.
+
+- Sections: executive summary, business impact, counts (verdict/priority/detection, alerts and events), top findings, technical appendix.
+- **All numbers come from SQL; Groq writes only the prose**: the summary and the business impact, in one call with aggregates, top findings, the Pi's own IPs (`hostname -I`) and `bia.json`. `--no-ai` or a Groq failure falls back to a fixed template, and the PDF says which was used.
+- Top findings group rows by signature + verdict + priority (the latest AI reason is shown, via SQLite's bare-column-with-`MAX(id)` rule); benign findings only fill a short list. `unknown` rows are shown as "not AI-reviewed", never as benign.
+- Business impact: thesis definitions of BIA/RTO/RPO are constants in `report.py` (word for word). Asset RTO/RPO values live in `bia.json`, labelled "Example values for a small organization, configurable"; the thesis has no target values.
 
 ## Anomaly detection (`anomaly.py`; steps 1-4 done, step 5 pending)
 
