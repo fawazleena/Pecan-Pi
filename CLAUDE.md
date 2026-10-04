@@ -4,7 +4,7 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-Pecan Pi: a Raspberry Pi network-security appliance. Suricata sniffs `wlan0` and writes events to `/var/log/suricata/eve.json`; a Python pipeline tails that file, batches alerts, sends them to an LLM on Groq (`openai/gpt-oss-120b`) for SOC-style triage, and stores alerts plus AI verdicts in SQLite (`pecan.db`).
+Pecan Pi: a Raspberry Pi network-security appliance. Suricata sniffs `wlan0` and `eth0` (both always listed in `deploy/override.conf`, so Wi-Fi or Ethernet works with no config change; an unplugged interface is just idle) and writes events to `/var/log/suricata/eve.json`; a Python pipeline tails that file, batches alerts, sends them to an LLM on Groq (`openai/gpt-oss-120b`) for SOC-style triage, and stores alerts plus AI verdicts in SQLite (`pecan.db`).
 
 ## Commands
 
@@ -16,7 +16,7 @@ There is no build, lint, or test suite. Scripts run directly with the venv inter
 .venv/bin/python analyze.py       # one-shot: triage the most recent real alert in eve.json
 .venv/bin/python alerts.py        # tail eve.json and print alerts, no AI
 .venv/bin/python tui.py         # Textual dashboard: service status + latest 50 alerts (read-only DB, run as normal user)
-.venv/bin/python anomaly.py snapshot --since 2026-10-05   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
+.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
 nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Forest -> anomaly_model.joblib
 .venv/bin/python anomaly.py eval FILE.jsonl               # score a flow file with the live code path
 .venv/bin/python make_replay.py SNAPSHOT --pi <pi-ip> --peer <laptop-ip> --out-dir replay   # offline attack replays (no network traffic)
@@ -59,7 +59,7 @@ The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-o
 
 `analyze.py` and `alerts.py` are earlier prototypes of the same flow, kept as standalone debugging tools.
 
-## Anomaly detection (`anomaly.py`, in progress)
+## Anomaly detection (`anomaly.py`; steps 1-4 done, step 5 pending)
 
 Isolation Forest on Suricata `flow` events, as a second detector next to signatures. Phases: collect baseline -> `snapshot` -> train -> live scoring inside `pipeline.py`. Broadcast/multicast destinations are excluded in both training and scoring (`is_broadcast_or_multicast`), since that chatter depends on which network the Pi is on.
 
@@ -69,6 +69,21 @@ Isolation Forest on Suricata `flow` events, as a second detector next to signatu
 - Test attacks only with `make_replay.py` + `eval` during baseline collection: no live scans until the baseline snapshot is taken.
 
 The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd timer, every ~10 min, `Nice=19`) generates benign DNS lookups, a few HTTPS fetches, and apt update every 6h. **The baseline is therefore partly synthetic**; say so in the thesis. Do not scan or test during the baseline window.
+
+**Baseline collection started 2026-10-04T22:32 (+03, Pi local time)**: after MAC logging was enabled and the logrotate tests finished. Earlier flows have no MACs; leave them out. Target: ~2,000 usable flows, 2-3 days (i.e. ~Oct 6-7).
+
+### Step 5 checklist (after collection)
+
+1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
+2. **Freeze the baseline:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --until <now>` -> `baseline_flows.jsonl`. Record the until-time and flow counts for the thesis.
+3. **Train:** `sudo nice -n 19 .venv/bin/python anomaly.py train` (sudo: the root-run pipeline must read the model). Record: fit/calibration sizes, threshold, held-out FP rate. Keep `--fp-budget 2` unless the held-out FP rate says otherwise; never tune it on attack results.
+4. **Offline evaluation (separate from calibration):** `make_replay.py baseline_flows.jsonl --pi <pi-ip> --peer <laptop-ip> --out-dir replay`, then `anomaly.py train --baseline replay/train.jsonl --out replay/model.joblib` and `anomaly.py eval replay/<file>.jsonl --model replay/model.joblib` for holdout, scan_pi_to_peer, scan_peer_to_pi, slow_scan_peer_to_pi, sweep_pi_ssh. Record FP on real flows and detection on synthetic per file.
+5. **Turn it on:** `sudo systemctl restart pecan-pipeline`; journal must say `anomaly detection on`. Note `kernel_drops` (`tail -n 2000 /var/log/suricata/eve.json | grep '"event_type":"stats"' | tail -1 | jq .stats.capture.kernel_drops`).
+6. **Live test A (Pi -> laptop):** on the Pi, `nmap -sT -T3 --top-ports 1000 <laptop-ip>` (connect scan, no scripts/version/OS detection). Wait ~2 min (flow timeout + 30s batch), then `sqlite3 pecan.db "SELECT id,detection,src_ip,dest_ip,count,score,signature,verdict,priority,reason FROM alerts WHERE detection='anomaly' ORDER BY id DESC LIMIT 5"`. Expect one anomaly row from the Pi with ~1000 ports and a real AI verdict. Note whether an `ET SCAN` signature also fired.
+7. **Live test B (laptop -> Pi):** on the Linux Mint laptop (`sudo apt install nmap`; Pi IP from `ip -br addr`), `nmap -sT -T3 --top-ports 1000 <pi-ip>`. Same check; expect one row laptop -> Pi.
+8. **Negative control:** ~30 min of normal use with the generator running; count anomaly rows (expect none or very few).
+9. **CPU:** `kernel_drops` after each scan must equal the value from 5.; glance at `top` during scans.
+10. **Then:** decide whether the traffic generator keeps running (the model learned its traffic as normal), retrain later on the demo network if it differs, and remember the Recon module's own nmap runs will be flagged.
 
 ## Project context
 - Final-year capstone, due in ~1 month. I must explain and defend every part of this code to an academic panel, so after each change give me a short plain-English summary of what changed and why.
