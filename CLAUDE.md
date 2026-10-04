@@ -15,6 +15,7 @@ There is no build, lint, or test suite. Scripts run directly with the venv inter
 .venv/bin/python test_groq.py     # sanity-check GROQ_API_KEY by listing available Groq models
 .venv/bin/python analyze.py       # one-shot: triage the most recent real alert in eve.json
 .venv/bin/python alerts.py        # tail eve.json and print alerts, no AI
+.venv/bin/python tui.py         # Textual dashboard: service status + latest 50 alerts (read-only DB, run as normal user)
 ```
 
 `GROQ_API_KEY` is read from `.env` (gitignored) via `load_dotenv()`.
