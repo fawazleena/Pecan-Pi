@@ -1,6 +1,7 @@
 import json, os
 from dotenv import load_dotenv
 from groq import Groq
+from triage import host_context
 
 load_dotenv()
 client = Groq(api_key=os.getenv("GROQ_API_KEY"))
@@ -19,13 +20,9 @@ with open("/var/log/suricata/eve.json") as f:
 if not alert:
     raise SystemExit("No real alerts found yet.")
 
-CONTEXT = (
-    "Environment: the local host is a Kali Linux security appliance on a home "
-    "network. It regularly runs apt updates from official Kali mirrors."
-)
 prompt = (
     "You are a SOC analyst triaging Suricata alerts.\n"
-    + CONTEXT + "\n"
+    + host_context() + "\n"
     "Suricata severity: 1 = highest, 3 = lowest.\n"
     "Use every field in the JSON (hostname, url, user agent, direction) plus "
     "general knowledge of well-known domains and software. Do not invent facts "

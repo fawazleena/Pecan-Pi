@@ -118,10 +118,10 @@ def fallback_text(d, bia, period):
 
 
 def ai_text(d, bia, period):
-    from triage import client, MODEL, CONTEXT, log_limits
+    from triage import client, MODEL, host_context, log_limits
     v, p, det = counts(d, "verdict"), counts(d, "priority"), counts(d, "detection")
     facts = {
-        "period": period, "this_appliance_ips": own_ips(), "alert_groups": d["groups"], "events": d["events"],
+        "period": period, "alert_groups": d["groups"], "events": d["events"],
         "by_verdict": {k: x[0] for k, x in v.items()}, "by_priority": {k: x[0] for k, x in p.items()},
         "by_detection": {k: x[0] for k, x in det.items()}, "not_reviewed_by_ai": d["untriaged"],
         "high_or_medium_alerts": d["impact_total"],
@@ -130,8 +130,8 @@ def ai_text(d, bia, period):
     }
     prompt = (
         "You write the plain-language parts of a network security report for non-technical managers.\n"
-        + CONTEXT + " Its own IP addresses are in this_appliance_ips: traffic from them comes from "
-        "the monitoring appliance itself, not from another device.\nUse ONLY the facts below; do not invent numbers, hosts or events. "
+        + host_context() + " Traffic from the local host IPs comes from the monitoring appliance itself, "
+        "not from another device.\nUse ONLY the facts below; do not invent numbers, hosts or events. "
         "Avoid jargon; if a technical term is needed, explain it in a few words. Plain text, no markdown.\n\n"
         "Write two sections, each starting with its marker on its own line:\n"
         "SUMMARY:\n150-250 words: what happened in the period, how serious it is, what (if anything) "
@@ -146,7 +146,7 @@ def ai_text(d, bia, period):
         + json.dumps(bia["assets"] if bia else []) + "\n\nFacts:\n" + json.dumps(facts, default=str))
     raw = client.chat.completions.with_raw_response.create(
         model=MODEL, messages=[{"role": "user", "content": prompt}],
-        max_completion_tokens=3000, reasoning_effort="low")
+        max_completion_tokens=3000, reasoning_effort="low", temperature=0)
     log_limits(raw.headers)
     text = raw.parse().choices[0].message.content or ""
     if "SUMMARY:" not in text or "IMPACT:" not in text:

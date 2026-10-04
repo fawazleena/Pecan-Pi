@@ -4,7 +4,7 @@ Groq free tier for openai/gpt-oss-120b allows 8,000 tokens per minute (prompt + 
 completion). A batch larger than that is rejected whole (HTTP 413), so batches are collapsed,
 cached, split into chunks and paced to stay under it.
 """
-import json, os, sqlite3, time
+import json, os, sqlite3, subprocess, time
 from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
@@ -15,9 +15,27 @@ client = Groq(api_key=os.getenv("GROQ_API_KEY"), max_retries=0)  # retries are d
 MODEL = "openai/gpt-oss-120b"
 
 CONTEXT = (
-    "Environment: the local host is a Kali Linux security appliance on a home "
-    "network. It regularly runs apt updates from official Kali mirrors."
+    "Environment: the local host is a Kali Linux security appliance (Raspberry Pi) on a home "
+    "network or phone hotspot. It regularly runs apt updates from official Kali mirrors. "
+    "It runs Tailscale (VPN), which every few minutes: sends STUN binding requests to Tailscale DERP "
+    "relay servers worldwide and receives their responses; connects to DERP servers over TLS; and has "
+    "its port mapper probe the default gateway with UPnP/SSDP (UDP 1900) and NAT-PMP/PCP (UDP 5351). "
+    "Those patterns are expected between the local host and DERP servers or the default gateway; "
+    "the same signatures between other hosts still deserve scrutiny."
 )
+
+
+def host_context():
+    """CONTEXT plus the host's current addresses (hotspot IPs change), looked up locally at call time."""
+    def run(*cmd):
+        try:
+            return subprocess.run(cmd, capture_output=True, text=True, timeout=5).stdout
+        except (OSError, subprocess.SubprocessError):
+            return ""
+    ips = run("hostname", "-I").split()
+    gw = [l.split()[2] for l in run("ip", "route", "show", "default").splitlines() if len(l.split()) > 2]
+    return (CONTEXT + f" Local host IPs: {', '.join(ips) or 'unknown'}."
+            f" Default gateway: {', '.join(gw) or 'unknown'}.")
 
 MAX_ITEMS = 25               # alerts per Groq call
 CHUNK_TOKENS = 3500          # estimated prompt tokens per call
@@ -25,8 +43,17 @@ MAX_COMPLETION = 2000        # reply budget; Groq counts it against the per-minu
 TPM_BUDGET = 7000            # stay under Groq's 8,000 tokens/minute
 MAX_RETRY_SECONDS = 90       # per flush; whatever is left stays 'AI unavailable' for backfill.py
 CACHE_HOURS = 6
+PREVIOUS_DAYS = 7          # how far back a 'previous_verdict' hint may come from
 SAMPLE = 10                  # IPs listed for a collapsed group
 UNTRIAGED = ("unknown", "unknown", "AI unavailable")
+
+
+def backup(db, path, why):
+    bak = f"{path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
+    b = sqlite3.connect(bak)
+    db.backup(b)
+    b.close()
+    print(f"backed up {path} to {bak} {why}")
 
 
 def open_db(path):
@@ -46,11 +73,7 @@ def open_db(path):
            ("n_src", "INTEGER"), ("n_dest", "INTEGER"), ("group_key", "TEXT"))
     missing = [c for c in new if c[0] not in cols]
     if missing:
-        bak = f"{path}.bak-{datetime.now():%Y%m%d-%H%M%S}"
-        b = sqlite3.connect(bak)
-        db.backup(b)
-        b.close()
-        print(f"backed up {path} to {bak} before adding columns {[c[0] for c in missing]}")
+        backup(db, path, f"before adding columns {[c[0] for c in missing]}")
         for name, decl in missing:
             db.execute(f"ALTER TABLE alerts ADD COLUMN {name} {decl}")
         db.commit()
@@ -96,32 +119,56 @@ def collapse(items):
     return out
 
 
-def cached(db, items, now):
-    """Reuse verdicts for signature items triaged by the AI in the CACHE_HOURS before `now`.
+def cache_keys(it):
+    """Group keys that count as 'the same host group' for an item: its own key, and for a single
+    src->dst pair also the merged groups it belongs to (src->* and *->dst)."""
+    keys = [it["group_key"]]
+    if (it.get("n_src") or 1) == 1 and (it.get("n_dest") or 1) == 1:
+        keys += [f"{it['src_ip']}->*", f"*->{it['dest_ip']}"]
+    return keys
 
-    Only real AI verdicts are reused, never rows that were themselves served from the cache,
-    so a verdict expires CACHE_HOURS after the AI last saw that alert. Anomalies are never
-    cached: their key is just a source IP, and a new scan must not inherit an old verdict.
+
+def last_verdict(db, it, since, until):
+    """Most recent real AI verdict for this rule and host group between since and until.
+    Rows served from the cache are never a source, so a verdict expires CACHE_HOURS after the
+    AI last judged it; the exact group key is preferred over a merged one."""
+    keys = cache_keys(it)
+    return db.execute(
+        "SELECT verdict, priority, reason FROM alerts WHERE detection = 'signature' AND sid = ? "
+        f"AND group_key IN ({','.join('?' * len(keys))}) AND seen_at >= ? AND seen_at <= ? "
+        "AND verdict != 'unknown' AND reason NOT LIKE '[cached]%' "
+        "ORDER BY group_key = ? DESC, seen_at DESC LIMIT 1",
+        (it["sid"], *keys, since, until, it["group_key"])).fetchone()
+
+
+def cached(db, items, now):
+    """Reuse verdicts for signature items the AI judged in the CACHE_HOURS before `now`.
+
+    On a miss, the last verdict from the PREVIOUS_DAYS before that is attached as
+    'previous_verdict', and the prompt asks the AI to keep it unless something changed, so
+    verdicts stay consistent when the cache expires. Anomalies are never cached or hinted:
+    their key is just a source IP, and a new scan must not inherit an old verdict.
     """
-    since = (datetime.fromisoformat(now) - timedelta(hours=CACHE_HOURS)).isoformat()
+    t = datetime.fromisoformat(now)
+    since = (t - timedelta(hours=CACHE_HOURS)).isoformat()
     hits = {}
     for it in items:
         if it["detection"] != "signature":
             continue
-        row = db.execute(
-            "SELECT verdict, priority, reason FROM alerts WHERE detection = 'signature' AND sid = ? "
-            "AND group_key = ? AND seen_at >= ? AND seen_at <= ? AND verdict != 'unknown' "
-            "AND reason NOT LIKE '[cached]%' ORDER BY seen_at DESC LIMIT 1",
-            (it["sid"], it["group_key"], since, now)).fetchone()
+        row = last_verdict(db, it, since, now)
         if row:
             hits[it["n"]] = (row[0], row[1], "[cached] " + row[2])
+            continue
+        row = last_verdict(db, it, (t - timedelta(days=PREVIOUS_DAYS)).isoformat(), since)
+        if row:
+            it["previous_verdict"] = f"{row[0]} | {row[1]} | {row[2]}"
     return hits
 
 
 def build_prompt(items):
     hidden = ("score", "ids", "group_key")
     return (
-        "You are a SOC analyst triaging grouped Suricata alerts.\n" + CONTEXT + "\n"
+        "You are a SOC analyst triaging grouped Suricata alerts.\n" + host_context() + "\n"
         "Suricata severity: 1 = highest, 3 = lowest. 'count' = times seen in this window.\n"
         "When one alert fired across many hosts, n_src/n_dest is how many distinct sources/destinations "
         "were involved and src_ips/dest_ips is a sample of them.\n"
@@ -130,12 +177,15 @@ def build_prompt(items):
         "src_flows, src_dest_ports and src_dest_ips are what the source did in the last 60s, "
         "src_unanswered is the fraction of those flows that got no real reply. "
         "Unusual is not necessarily malicious.\n"
+        "previous_verdict, if present, is what was decided earlier for the same rule and hosts: "
+        "keep it for consistency unless this alert's fields show something new, and if you change it "
+        "say what changed.\n"
         "Use every field plus general knowledge of well-known domains and software. "
         "Do not invent facts.\n"
         "For EACH alert output exactly one line, nothing else:\n"
         "n | verdict (benign/suspicious/malicious) | priority (low/medium/high) | short reason\n"
         "where n is the alert's 'n' field. Each reason must make sense on its own (it may be "
-        "reused for later alerts): never refer to other items by number.\n\n"
+        "reused for later alerts): never refer to other items ('as above', 'same as', item numbers).\n\n"
         + json.dumps([{k: v for k, v in it.items() if k not in hidden} for it in items])
     )
 
@@ -212,7 +262,7 @@ def call(items, deadline):
         try:
             raw = client.chat.completions.with_raw_response.create(
                 model=MODEL, messages=[{"role": "user", "content": prompt}],
-                max_completion_tokens=MAX_COMPLETION, reasoning_effort="low")
+                max_completion_tokens=MAX_COMPLETION, reasoning_effort="low", temperature=0)
             log_limits(raw.headers)
             r = raw.parse()
             if r.choices[0].finish_reason == "length":
