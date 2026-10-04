@@ -1,0 +1,10 @@
+[Unit]
+Description=Run Pecan Pi benign traffic generator every ~10 minutes
+
+[Timer]
+OnBootSec=2min
+OnUnitActiveSec=10min
+RandomizedDelaySec=3min
+
+[Install]
+WantedBy=timers.target

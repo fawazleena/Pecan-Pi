@@ -65,23 +65,52 @@ def flush(pending):
         print(f"[{priority:>7}] {verdict:<10} {it['signature']} x{it['count']} | {reason}")
     db.commit()
 
+def handle(line, pending):
+    try:
+        e = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if e.get("event_type") == "alert" and e["alert"]["signature_id"] not in IGNORE_SIDS:
+        key = (e["alert"]["signature_id"], e.get("src_ip"), e.get("dest_ip"))
+        old = pending.get(key)
+        pending[key] = (old[0], old[1] + 1) if old else (e, 1)
+
+def open_eve():
+    while True:
+        try:
+            return open(EVE)
+        except FileNotFoundError:
+            time.sleep(1)
+
+def reopen_if_rotated(f, pending):
+    """logrotate renames eve.json and Suricata starts a new one (inode changes),
+    or the file is truncated in place (size drops below our position)."""
+    try:
+        st = os.stat(EVE)
+    except FileNotFoundError:
+        return f  # mid-rotation: keep the old handle until the new file appears
+    if st.st_ino != os.fstat(f.fileno()).st_ino:
+        for line in f:  # drain anything written to the old file before the switch
+            handle(line, pending)
+        f.close()
+        print("eve.json rotated, reopening")
+        return open_eve()  # new file: read from the start, everything in it is new
+    if st.st_size < f.tell():
+        print("eve.json truncated, rewinding")
+        f.seek(0)
+    return f
+
 pending, last_flush = {}, time.time()
 print("Pecan Pi pipeline running...")
-with open(EVE) as f:
-    f.seek(0, 2)
-    while True:
-        line = f.readline()
-        if line:
-            try:
-                e = json.loads(line)
-            except json.JSONDecodeError:
-                continue
-            if e.get("event_type") == "alert" and e["alert"]["signature_id"] not in IGNORE_SIDS:
-                key = (e["alert"]["signature_id"], e.get("src_ip"), e.get("dest_ip"))
-                old = pending.get(key)
-                pending[key] = (old[0], old[1] + 1) if old else (e, 1)
-        else:
-            time.sleep(0.5)
-        if pending and time.time() - last_flush >= BATCH_SECONDS:
-            flush(pending)
-            pending, last_flush = {}, time.time()
+f = open_eve()
+f.seek(0, 2)
+while True:
+    line = f.readline()
+    if line:
+        handle(line, pending)
+    else:
+        f = reopen_if_rotated(f, pending)
+        time.sleep(0.5)
+    if pending and time.time() - last_flush >= BATCH_SECONDS:
+        flush(pending)
+        pending, last_flush = {}, time.time()

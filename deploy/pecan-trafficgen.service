@@ -1,0 +1,9 @@
+[Unit]
+Description=Pecan Pi benign traffic generator (anomaly baseline)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/home/raven/pecan-pi/trafficgen.sh
+Nice=19

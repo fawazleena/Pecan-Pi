@@ -1,0 +1,13 @@
+/var/log/suricata/*.log
+/var/log/suricata/*.json
+{
+	rotate 14
+	missingok
+	compress
+	delaycompress
+	create
+	sharedscripts
+	postrotate
+		/usr/bin/systemctl kill -s HUP suricata.service 2>/dev/null || true
+	endscript
+}
