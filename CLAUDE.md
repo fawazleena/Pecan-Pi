@@ -15,6 +15,7 @@ There is no build, lint, or test suite. Scripts run directly with the venv inter
 .venv/bin/python test_groq.py     # sanity-check GROQ_API_KEY by listing available Groq models
 .venv/bin/python analyze.py       # one-shot: triage the most recent real alert in eve.json
 .venv/bin/python alerts.py        # tail eve.json and print alerts, no AI
+sudo .venv/bin/python backfill.py  # re-triage 'AI unavailable' rows (--dry-run: no API calls/writes)
 .venv/bin/python tui.py         # Textual dashboard: service status + latest 50 alerts (read-only DB, run as normal user)
 .venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
 nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Forest -> anomaly_model.joblib
@@ -48,14 +49,18 @@ After changing one, copy it into place, then `sudo systemctl daemon-reload` and 
 
 The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-owned; running `pipeline.py` manually as a regular user will fail to write the DB (and may lack read access to `eve.json`). Stop the service before running it manually to avoid two writers.
 
-## Pipeline architecture (`pipeline.py`)
+## Pipeline architecture (`pipeline.py` + `triage.py`)
 
 - Opens `eve.json` and seeks to the end — only events arriving after startup are processed; restarting the service drops anything in the current batch.
 - Alerts are deduplicated in memory by `(signature_id, src_ip, dest_ip)` with a count; the first event of each group is kept as the representative.
-- Every `BATCH_SECONDS` (30), the batch is flushed: each group is slimmed to a fixed set of fields, numbered with `n`, and sent in **one** LLM call.
-- The prompt requires one line per alert in the form `n | verdict | priority | reason`; `triage()` parses lines by splitting on `|`. Any prompt change must keep this format in sync with the parser. Unparsed alerts or API errors are stored with verdict/priority `unknown` and reason `AI unavailable` rather than dropped.
+- Every `BATCH_SECONDS` (30), the batch is flushed: each group is slimmed to a fixed set of fields, then `triage.collapse()` merges groups of the same SID that share a source or a destination (whichever side gives fewer groups), recording `n_src`/`n_dest` and a `group_key` (`src->*`, `*->dst` or `src->dst`). Reason: Tailscale on the Pi does a STUN netcheck to ~70 relay servers every ~5 min, which used to be ~150 groups (~17k tokens) in one call.
+- Groq free tier for `openai/gpt-oss-120b`: **8,000 tokens/minute** (prompt + requested completion) and 1,000 requests/day. An oversized request gets HTTP 413 and retrying cannot help. `triage_all()` therefore sends chunks (<=25 items, ~3,500 estimated prompt tokens, `max_completion_tokens=2000`, `reasoning_effort="low"`), paces them under 7,000 tokens/min, backs off on 429, halves a chunk on 413, and gives up after 90s per flush. Every call logs `groq limits: requests left today X/Y, tokens left this minute A/B` (Groq has no daily-token header).
+- **Verdict cache:** a signature item whose `(sid, group_key)` got a real AI verdict in the last 6h reuses it, reason prefixed `[cached]`. Cached rows are never a cache source, so verdicts expire 6h after the AI last judged them. Anomalies are never cached (a new scan must not inherit an old verdict).
+- The prompt requires one line per alert in the form `n | verdict | priority | reason`; `triage.parse()` splits on `|`. Any prompt change must keep this format in sync with the parser. Unparsed alerts or API errors are stored with verdict/priority `unknown` and reason `AI unavailable` rather than dropped.
+- **Backfill:** `sudo .venv/bin/python backfill.py [--since ...] [--dry-run]` re-triages `AI unavailable` rows per original batch (same `seen_at`), oldest first. The DB has no payload fields (http/tls/dns), so those reasons are prefixed `[backfill]`. On 2026-10-04 it fixed 1,556 rows (all STUN-burst 413s) with one Groq call plus the cache.
 - `CONTEXT` describes the host environment to the model to reduce false positives; it is duplicated in `analyze.py`.
-- The `alerts` table is created with `CREATE TABLE IF NOT EXISTS`; there are no migrations, so schema changes need a manual `ALTER TABLE` or recreating `pecan.db`.
+- Schema: `triage.open_db()` creates the table and adds missing columns with `ALTER TABLE`, backing up `pecan.db` first (`pecan.db.bak-*`).
+- Tailscale started 2026-10-04T22:23, before the anomaly baseline (22:32): its STUN/DERP flows are part of the baseline. Keep it running, and say so in the thesis.
 
 `analyze.py` and `alerts.py` are earlier prototypes of the same flow, kept as standalone debugging tools.
 

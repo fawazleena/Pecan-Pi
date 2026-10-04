@@ -30,7 +30,7 @@ def query(hide_benign):
         counts = dict(db.execute("SELECT verdict, COUNT(*) FROM alerts GROUP BY verdict"))
         where = "WHERE verdict != 'benign'" if hide_benign else ""
         rows = db.execute(
-            "SELECT id, seen_at, detection, score, priority, verdict, signature, src_ip, dest_ip, count, reason "
+            "SELECT id, seen_at, detection, score, priority, verdict, signature, src_ip, dest_ip, n_src, n_dest, count, reason "
             f"FROM alerts {where} ORDER BY id DESC LIMIT ?", (LIMIT,)).fetchall()
     finally:
         db.close()
@@ -40,6 +40,11 @@ def query(hide_benign):
 def shorten(text, width):
     text = str(text)
     return text if len(text) <= width else text[:width - 1] + "…"
+
+
+def endpoint(ip, n):
+    # n > 1: one alert collapsed across many hosts (see triage.collapse); ip is the first of them.
+    return f"{ip} (+{n - 1} hosts)" if n and n > 1 else str(ip)
 
 
 def local_time(iso):
@@ -107,7 +112,8 @@ class PecanTUI(App):
         selected = self.highlighted_key(table)
         table.clear()
         self.details = {}
-        for alert_id, seen_at, detection, score, priority, verdict, sig, src, dst, count, reason in rows:
+        for alert_id, seen_at, detection, score, priority, verdict, sig, src, dst, n_src, n_dest, count, reason in rows:
+            src, dst = endpoint(src, n_src), endpoint(dst, n_dest)
             key = str(alert_id)
             self.details[key] = (detection, score, sig, src, dst, reason)
             style = ROW_STYLE.get(priority, "")
