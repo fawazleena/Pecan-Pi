@@ -9,6 +9,8 @@ WorkingDirectory=/home/raven/pecan-pi
 ExecStart=/home/raven/pecan-pi/.venv/bin/python pipeline.py
 Environment=PYTHONUNBUFFERED=1
 Restart=on-failure
+Nice=10
+CPUQuota=50%
 RestartSec=10
 
 [Install]
