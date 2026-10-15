@@ -1,0 +1,35 @@
+[Unit]
+Description=Pecan Pi decoy SSH service with automatic nftables blocking
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Standard library only, so the system Python; /home/raven is 0700, so the two source files
+# (and the optional allowlist) are bind-mounted read-only into the sandbox instead.
+BindReadOnlyPaths=/home/raven/pecan-pi/honeypot.py:/opt/pecan/honeypot.py
+BindReadOnlyPaths=/home/raven/pecan-pi/netinfo.py:/opt/pecan/netinfo.py
+BindReadOnlyPaths=-/home/raven/pecan-pi/allowlist.txt:/opt/pecan/allowlist.txt
+ExecStart=/usr/bin/python3 /opt/pecan/honeypot.py serve
+# Stopping the service lifts every block ('-': no error if the table is already gone).
+ExecStopPost=-/usr/sbin/nft delete table inet pecan
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+Environment=PECAN_BLOCK_SECONDS=3600
+# Least privilege: a throwaway user with only the capability nft needs.
+DynamicUser=yes
+AmbientCapabilities=CAP_NET_ADMIN
+CapabilityBoundingSet=CAP_NET_ADMIN
+NoNewPrivileges=yes
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+LogsDirectory=pecan
+# Never take CPU from Suricata, even under a connection flood.
+Nice=10
+CPUQuota=10%
+MemoryMax=64M
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

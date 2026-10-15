@@ -7,10 +7,11 @@ DB = "pecan.db"
 BATCH_SECONDS = 30
 IGNORE_SIDS = {9000001}  # ping test rule
 ANOMALY_MODEL = "anomaly_model.joblib"
+HONEYPOT_LOG = "/var/log/pecan/honeypot.json"  # written by honeypot.py (pecan-honeypot.service)
 
 db = open_db(DB)
 
-def flush(pending, anomalies):
+def flush(pending, anomalies, hits):
     items = []
     for key, (e, count) in pending.items():
         slim = {k: e.get(k) for k in ("src_ip", "dest_ip", "dest_port", "proto", "app_proto", "http", "tls", "dns")}
@@ -23,6 +24,10 @@ def flush(pending, anomalies):
                       "dest_ports": g["dest_ports_sample"], "n_dest_ports": g["n_dest_ports"],
                       "count": g["count"], "score": g["score"],
                       **{k: g[k] for k in ("src_flows", "src_dest_ports", "src_dest_ips", "src_unanswered")}})
+    for src, (h, count) in hits.items():
+        items.append({"detection": "honeypot", "signature": f"Honeypot: connection to decoy SSH port {h['dest_port']}",
+                      "src_ip": src, "dest_ip": h["dest_ip"], "dest_port": h["dest_port"], "count": count,
+                      "client_banner": h.get("client_banner"), "action": h.get("action")})
     items = collapse(items)
     for n, it in enumerate(items):
         it["n"] = n
@@ -33,13 +38,14 @@ def flush(pending, anomalies):
         verdict, priority, reason = results.get(it["n"], UNTRIAGED)
         db.execute(
             "INSERT INTO alerts (seen_at, sid, signature, severity, src_ip, dest_ip, count, verdict, priority, reason, "
-            "detection, score, n_src, n_dest, group_key) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+            "detection, score, n_src, n_dest, group_key, action) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
             (now, it.get("sid"), it["signature"], it.get("severity"), it["src_ip"], it["dest_ip"],
              it["count"], verdict, priority, reason, it["detection"], it.get("score"),
-             it.get("n_src"), it.get("n_dest"), it.get("group_key")))
+             it.get("n_src"), it.get("n_dest"), it.get("group_key"), it.get("action")))
         hosts = max(it.get("n_src") or 1, it.get("n_dest") or 1)
         print(f"[{priority:>7}] {verdict:<10} {it['signature']} x{it['count']}"
-              + (f" ({hosts} hosts)" if hosts > 1 else "") + f" | {reason}")
+              + (f" ({hosts} hosts)" if hosts > 1 else "")
+              + (f" [{it['action']}]" if it.get("action") else "") + f" | {reason}")
     db.commit()
 
 def handle(line, pending):
@@ -57,33 +63,63 @@ def handle(line, pending):
         except Exception as err:
             print("anomaly error:", err)
 
-def open_eve():
-    while True:
-        try:
-            return open(EVE)
-        except FileNotFoundError:
-            time.sleep(1)
-
-def reopen_if_rotated(f, pending):
-    """logrotate renames eve.json and Suricata starts a new one (inode changes),
-    or the file is truncated in place (size drops below our position)."""
+def handle_hit(line, hits):
+    """One decoy connection; deduplicated per source IP for the batch, first hit kept."""
     try:
-        st = os.stat(EVE)
-    except FileNotFoundError:
-        return f  # mid-rotation: keep the old handle until the new file appears
-    if st.st_ino != os.fstat(f.fileno()).st_ino:
-        for line in f:  # drain anything written to the old file before the switch
-            handle(line, pending)
-        f.close()
-        print("eve.json rotated, reopening")
-        return open_eve()  # new file: read from the start, everything in it is new
-    if st.st_size < f.tell():
-        print("eve.json truncated, rewinding")
-        f.seek(0)
-    return f
+        h = json.loads(line)
+    except json.JSONDecodeError:
+        return
+    if h.get("src_ip"):
+        old = hits.get(h["src_ip"])
+        hits[h["src_ip"]] = (old[0], old[1] + 1) if old else (h, 1)
 
-f = open_eve()
-f.seek(0, 2)  # position first: events arriving while sklearn loads (~9s) are still read
+class Tail:
+    """Follow a log file from its current end, across logrotate and truncation.
+
+    A file that does not exist yet (honeypot.json before the first hit) is opened when it
+    appears and read from the start. wait=True blocks until it exists (eve.json)."""
+    def __init__(self, path, handle, wait=False):
+        self.path, self.handle = path, handle
+        self.f = self.open()
+        while wait and not self.f:
+            time.sleep(1)
+            self.f = self.open()
+        if self.f:
+            self.f.seek(0, 2)  # only events arriving after startup
+
+    def open(self):
+        try:
+            return open(self.path)
+        except FileNotFoundError:
+            return None
+
+    def readline(self):
+        return self.f.readline() if self.f else ""
+
+    def check(self):
+        """logrotate renames the file and the writer starts a new one (inode changes),
+        or the file is truncated in place (size drops below our position)."""
+        if not self.f:
+            self.f = self.open()  # new file: everything in it is new
+            return
+        try:
+            st = os.stat(self.path)
+        except FileNotFoundError:
+            return  # mid-rotation: keep the old handle until the new file appears
+        if st.st_ino != os.fstat(self.f.fileno()).st_ino:
+            for line in self.f:  # drain anything written to the old file before the switch
+                self.handle(line)
+            self.f.close()
+            print(f"{self.path} rotated, reopening")
+            self.f = self.open()
+        elif st.st_size < self.f.tell():
+            print(f"{self.path} truncated, rewinding")
+            self.f.seek(0)
+
+pending, hits = {}, {}
+# Position first: events arriving while sklearn loads (~9s) are still read.
+eve = Tail(EVE, lambda line: handle(line, pending), wait=True)
+honeypot = Tail(HONEYPOT_LOG, lambda line: handle_hit(line, hits))
 
 scorer = None
 if os.path.exists(ANOMALY_MODEL):
@@ -96,14 +132,17 @@ if os.path.exists(ANOMALY_MODEL):
 else:
     print(f"anomaly detection off: no {ANOMALY_MODEL}")
 
-pending, last_flush = {}, time.time()
+last_flush = time.time()
 print("Pecan Pi pipeline running...")
 while True:
-    line = f.readline()
+    line = eve.readline()
     if line:
         handle(line, pending)
     else:
-        f = reopen_if_rotated(f, pending)
+        for line in iter(honeypot.readline, ""):
+            handle_hit(line, hits)
+        eve.check()
+        honeypot.check()
         time.sleep(0.5)
     if time.time() - last_flush >= BATCH_SECONDS:
         try:
@@ -111,6 +150,8 @@ while True:
         except Exception as err:
             print("anomaly error:", err)
             anomalies = []
-        if pending or anomalies:
-            flush(pending, anomalies)
-        pending, last_flush = {}, time.time()
+        if pending or anomalies or hits:
+            flush(pending, anomalies, hits)
+        pending.clear()  # cleared, not rebound: the Tail handlers hold these dicts
+        hits.clear()
+        last_flush = time.time()

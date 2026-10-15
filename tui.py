@@ -7,7 +7,7 @@ from textual.app import App
 from textual.widgets import DataTable, Footer, Static
 
 DB = Path(__file__).with_name("pecan.db")
-SERVICES = ("suricata", "pecan-pipeline")
+SERVICES = ("suricata", "pecan-pipeline", "pecan-honeypot")
 REFRESH_SECONDS = 5
 LIMIT = 50
 ROW_STYLE = {"high": "bold red", "medium": "yellow", "low": "dim"}
@@ -30,7 +30,7 @@ def query(hide_benign):
         counts = dict(db.execute("SELECT verdict, COUNT(*) FROM alerts GROUP BY verdict"))
         where = "WHERE verdict != 'benign'" if hide_benign else ""
         rows = db.execute(
-            "SELECT id, seen_at, detection, score, priority, verdict, signature, src_ip, dest_ip, n_src, n_dest, count, reason "
+            "SELECT id, seen_at, detection, score, priority, verdict, signature, src_ip, dest_ip, n_src, n_dest, count, reason, action "
             f"FROM alerts {where} ORDER BY id DESC LIMIT ?", (LIMIT,)).fetchall()
     finally:
         db.close()
@@ -64,7 +64,7 @@ class PecanTUI(App):
     BINDINGS = [("q", "quit", "Quit"), ("r", "refresh", "Refresh"), ("f", "toggle_benign", "Hide benign")]
 
     hide_benign = False
-    details = {}  # row key (DB id) -> (detection, score, signature, src, dst, reason) for the detail panel
+    details = {}  # row key (DB id) -> (detection, score, signature, src, dst, reason, action) for the detail panel
 
     def compose(self):
         yield Static("Loading...", id="status")
@@ -112,10 +112,10 @@ class PecanTUI(App):
         selected = self.highlighted_key(table)
         table.clear()
         self.details = {}
-        for alert_id, seen_at, detection, score, priority, verdict, sig, src, dst, n_src, n_dest, count, reason in rows:
+        for alert_id, seen_at, detection, score, priority, verdict, sig, src, dst, n_src, n_dest, count, reason, action in rows:
             src, dst = endpoint(src, n_src), endpoint(dst, n_dest)
             key = str(alert_id)
-            self.details[key] = (detection, score, sig, src, dst, reason)
+            self.details[key] = (detection, score, sig, src, dst, reason, action)
             style = ROW_STYLE.get(priority, "")
             cells = (local_time(seen_at), detection, priority, verdict, shorten(sig, SIGNATURE_WIDTH),
                      f"{src} -> {dst}", str(count), shorten(reason, REASON_WIDTH))
@@ -137,11 +137,11 @@ class PecanTUI(App):
         if key not in self.details:
             detail.update(Text("No alert selected", style="dim"))
             return
-        detection, score, sig, src, dst, reason = self.details[key]
+        detection, score, sig, src, dst, reason, action = self.details[key]
         text = Text()
         kind = detection if score is None else f"{detection} (Isolation Forest score {score})"
         for label, value in (("Type", kind), ("Signature", sig), ("Src -> Dst", f"{src} -> {dst}"),
-                             ("Reason", reason)):
+                             ("Reason", reason)) + ((("Action", action),) if action else ()):
             text.append(f"{label}: ", style="bold")
             text.append(f"{value}\n")
         text.rstrip()

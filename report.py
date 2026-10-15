@@ -50,6 +50,10 @@ def load(since, until, top):
                    f"GROUP BY 1 ORDER BY {order}")
     d["untriaged"] = q(f"SELECT COUNT(*) FROM alerts WHERE {rng} AND NOT {TRIAGED}")[0][0]
     d["anomaly_scores"] = q(f"SELECT MIN(score), MAX(score) FROM alerts WHERE {rng} AND detection = 'anomaly'")[0]
+    # 'action' is added by the pipeline's first run with the honeypot; a DB from before has none.
+    has_action = any(r[1] == "action" for r in db.execute("PRAGMA table_info(alerts)"))
+    d["blocked"] = q(f"SELECT COUNT(DISTINCT src_ip) FROM alerts WHERE {rng} AND detection = 'honeypot' "
+                     "AND action LIKE 'blocked%'")[0][0] if has_action else 0
 
     # Findings: rows of the same signature/verdict/priority taken together. With MAX(id), SQLite takes
     # the bare columns (reason, src_ip, ...) from that row, so the reason shown is the latest one.
@@ -220,6 +224,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
   <div class="tile"><b>{{ pr.get('high', (0,0))[0] }}</b><span>high priority</span></div>
   <div class="tile"><b>{{ vd.get('malicious', (0,0))[0] + vd.get('suspicious', (0,0))[0] }}</b><span>suspicious or malicious</span></div>
   <div class="tile"><b>{{ dt.get('anomaly', (0,0))[0] }}</b><span>anomaly detections</span></div>
+  <div class="tile"><b>{{ dt.get('honeypot', (0,0))[0] }}</b><span>honeypot hits (blocked IPs: {{ d.blocked }})</span></div>
 </div>{% endif %}
 {% for kind, body in summary %}{% if kind == 'p' %}<p>{{ body }}</p>{% else %}<ul>{% for i in body %}<li>{{ i }}</li>{% endfor %}</ul>{% endif %}{% endfor %}
 <p class="badge">{{ source }}</p>
@@ -248,7 +253,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
 <p class="note">Alerts of the same rule, verdict and priority are shown together; the reason is the AI's most recent one.</p>
 <table class="small"><tr><th>Priority</th><th>Verdict</th><th>Finding</th><th>Hosts (latest)</th><th class="n">Alerts / events</th><th>Last seen</th><th>AI reason</th></tr>
 {% for f in d.top %}<tr class="{{ f.priority }}"><td>{{ f.priority }}</td><td>{{ f.verdict }}</td>
-<td>{{ f.signature }}{% if f.detection == 'anomaly' %} <i>(anomaly)</i>{% endif %}</td>
+<td>{{ f.signature }}{% if f.detection in ('anomaly', 'honeypot') %} <i>({{ f.detection }})</i>{% endif %}</td>
 <td>{{ endpoint(f.src, f.n_src) }} → {{ endpoint(f.dst, f.n_dest) }}</td><td class="n">{{ f.rows }} / {{ f.events }}</td>
 <td>{{ show_time(f.last) }}</td><td>{{ f.reason }}</td></tr>{% endfor %}</table>
 {% else %}<p>No AI-reviewed alerts in this period.</p>{% endif %}
@@ -256,6 +261,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
 <h2>Technical appendix</h2>
 <ul class="small">
 <li><b>Detection.</b> Suricata IDS on wlan0 and eth0 with the Emerging Threats ruleset plus local rules; SID 9000001 (ICMP echo test rule) is ignored.{% if model %} Anomaly detection: Isolation Forest on flow features{% if model.error %} (model metadata unreadable: {{ model.error }}){% else %}, threshold {{ model.threshold | round(4) }}, false-positive budget {{ model.fp_budget }}%, fitted on {{ model.n_fit }} flows, calibrated on {{ model.n_calib }} held-out flows, {{ model.window }} s source window, scikit-learn {{ model.sklearn }}{% endif %}.{% else %} Anomaly detection: no trained model present when this report was generated.{% endif %}</li>
+<li><b>Prevention.</b> A decoy SSH service listens on a port where no real service runs. A source that completes a connection to it is blocked at wlan0/eth0 with nftables for a fixed time, unless it is the Pi itself, the default gateway, arrived over Tailscale, or is on the allowlist. The block happens at once and does not depend on the AI verdict.</li>
 <li><b>AI triage.</b> {{ model_name }} on Groq. Alerts are batched every 30 s, deduplicated by rule, source and destination, and alerts of the same rule sharing a source or destination are merged ("+N hosts"). A verdict for the same rule and host group from the previous 6 hours is reused (reason starts with <code>[cached]</code>). <code>[backfill]</code> marks verdicts given later from stored fields only, without packet details.</li>
 <li><b>Not AI-reviewed.</b> {{ d.untriaged }} alerts in this period have verdict "unknown" (AI unavailable at the time). They are counted as unknown, never as benign.</li>
 <li><b>Timestamps.</b> Times are when a batch was stored (at most about 30 s after the event), shown in the Pi's local time. Range filter: <code>seen_at &gt;= '{{ since }}' AND seen_at &lt; '{{ until }}'</code> (UTC){% if d.first %}; data spans {{ show_time(d.first) }} to {{ show_time(d.last) }}{% endif %}.</li>

@@ -22,6 +22,8 @@ sudo .venv/bin/python backfill.py  # re-triage 'AI unavailable' rows (--dry-run:
 nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Forest -> anomaly_model.joblib
 .venv/bin/python anomaly.py eval FILE.jsonl               # score a flow file with the live code path
 .venv/bin/python make_replay.py SNAPSHOT --pi <pi-ip> --peer <laptop-ip> --out-dir replay   # offline attack replays (no network traffic)
+sudo python3 honeypot.py list | unblock IP | unblock-all   # current honeypot blocks (nftables table inet pecan)
+python3 honeypot.py serve --dry-run --port 2223          # decoy without firewall changes (service must not hold the port)
 ```
 
 `GROQ_API_KEY` is read from `.env` (gitignored) via `load_dotenv()`.
@@ -42,6 +44,8 @@ Files in `deploy/` are copies of what is installed on the Pi; editing them in th
 | `deploy/logrotate-suricata` | `/etc/logrotate.d/suricata` |
 | `deploy/pecan-trafficgen.service` / `.timer` | `/etc/systemd/system/` (enable the `.timer`) |
 | `deploy/pecan-logrotate.service` / `.timer` | `/etc/systemd/system/` (enable the `.timer`) |
+| `deploy/pecan-honeypot.service` | `/etc/systemd/system/pecan-honeypot.service` (enable it) |
+| `deploy/logrotate-pecan` | `/etc/logrotate.d/pecan` |
 
 `/etc/suricata/suricata.yaml` is not in the repo; local change: `ethernet: yes` under eve-log (logs MAC addresses, used by `anomaly.py` to drop broadcast/multicast flows).
 
@@ -65,6 +69,18 @@ The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-o
 - Tailscale started 2026-10-04T22:23, before the anomaly baseline (22:32): its STUN/DERP flows are part of the baseline. Keep it running, and say so in the thesis.
 
 `analyze.py` and `alerts.py` are earlier prototypes of the same flow, kept as standalone debugging tools.
+
+## Honeypot + prevention (`honeypot.py`, `pecan-honeypot.service`)
+
+The "P" in IDPS. A decoy SSH service on TCP 2222 (nothing legitimate runs there): on each completed connection it blocks the source with nftables, sends a real OpenSSH banner, reads at most 256 bytes (the client banner) for up to 10 s, closes, and appends one JSON line to `/var/log/pecan/honeypot.json`. No auth, no shell, attacker bytes are only stored (printable ASCII, 128 chars). `pipeline.py` tails that file next to `eve.json` (`Tail` class), groups hits per source IP per 30 s batch, triages them like anything else (`detection='honeypot'`, never cached, `action` column = what the firewall did) and the TUI/report show them.
+
+- **Block first, AI after:** the block is immediate and does not depend on the AI verdict (AI may be down; the banner is attacker-controlled text, so prompt injection cannot unblock anyone). Blocking happens only after a completed TCP handshake, so a spoofed source cannot get someone else blocked.
+- **nftables:** own table `inet pecan`, sets `blocked4`/`blocked6` with `timeout` (`PECAN_BLOCK_SECONDS`, default 3600; kernel expires them, even if the service crashed), chain at input priority -10, policy accept. Only `iifname wlan0/eth0` is filtered, so `tailscale0` (SSH over Tailscale) and `lo` are never touched. Exempt: UDP 41641 (Tailscale's WireGuard; keeps a laptop's direct Tailscale path up when its LAN IP is blocked; WireGuard ignores unauthenticated packets), and established connections to 2222 (so the decoy can finish reading the connection that caused the block). Restart, stop (`ExecStopPost` deletes the table) and reboot all clear every block: deliberately not persisted.
+- **Allowlist** (re-read at every hit, hotspot IPs change; `netinfo.py`): loopback, the Pi's IPs, default gateway(s), anything whose local address is on `tailscale0` (by interface, not by 100.64.0.0/10, which is also carrier-grade NAT space), optional `allowlist.txt` (IP/CIDR per line, `#` comments; restart the service after creating it). Deliberately NOT allowlisted: IPs with an established SSH session (TCP to :22 is ESTABLISHED before authentication). Allowlisted hits are still logged and triaged (`not blocked: allowlisted (...)`).
+- **Service:** `DynamicUser` + only `CAP_NET_ADMIN`, `ProtectSystem=strict`, system `python3` (stdlib only); `/home/raven` is 0700, so `honeypot.py`, `netinfo.py` (and `allowlist.txt`) are bind-mounted to `/opt/pecan` read-only. `Nice=10`, `CPUQuota=10%`, `MemoryMax=64M`, max 50 concurrent connections. Editing either file needs `sudo systemctl restart pecan-honeypot`.
+- **Installed block time is 600 s, not the repo's 3600 s:** a drop-in (`sudo systemctl edit pecan-honeypot` -> `/etc/systemd/system/pecan-honeypot.service.d/override.conf`, `[Service]` `Environment=PECAN_BLOCK_SECONDS=600`) is kept for testing and the demo. Back to 1 h: `sudo systemctl revert pecan-honeypot && sudo systemctl restart pecan-honeypot`. Check: `systemctl show pecan-honeypot -p Environment`.
+- **Live test passed (2026-10-16):** `nc` from the laptop's hotspot IP (192.168.221.65) to 2222 was logged with its banner and blocked (nc + ping timed out); Tailscale ping and SSH stayed up; DB row 2725: `detection=honeypot`, `action=blocked 600s`, AI `suspicious`/`medium`; `honeypot.py unblock` restored access.
+- **Limitations for the thesis:** a scanner that never touches 2222 is not blocked; IP blocks are weak against an attacker who changes IP; Tailscale and the gateway are a deliberate blind spot; blocks do not survive reboot by design. nmap's default/top-1000 port lists may include 2222: the anomaly live test from the laptop (step 7) and the Recon module's own scans can block their own source, so unblock between tests.
 
 ## Reporting (`report.py`)
 
