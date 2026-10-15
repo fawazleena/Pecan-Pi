@@ -142,6 +142,21 @@ A model trained on one network does not transfer to another. Baseline 1 was reco
 
 **Results (2026-10-16, steps 1-4):** live model: fit 24,304 / calibration 6,077, threshold -0.5980, flags 2.0% of held-out flows (4.2% of fit flows). Replay (`--pi 192.168.100.15 --peer 192.168.100.65`; `replay/` is gitignored, it holds real flows): FP on real holdout 2.4%; detected 991/1000 for both 1000-port scans, 91/100 for the slow scan, **0/50 for the SSH sweep** (likely looks like Tailscale's STUN fan-out to ~70 relays in the baseline; not tuned away, report as a limitation).
 
+### CIC-IDS2017 evaluation (`cic_eval.py`, 2026-10-16)
+
+Both detectors on public labelled data. Monday pcap (benign) and Friday (attacks) were replayed on the laptop (Suricata 7.0.3, its own ET Open rules, default yaml, `-k none`, no MAC logging, so the broadcast filter uses its IP fallback); slim gzipped flow/alert events live in `cic/` (gitignored; `cic/provenance.txt` has versions and hashes). Friday was replayed twice: (a) default HOME_NET (all RFC1918, as on the Pi) and (b) `HOME_NET=192.168.10.0/24`.
+
+```sh
+.venv/bin/python cic_eval.py verify             # schedule vs traffic (writes nothing)
+nice -n 19 .venv/bin/python cic_eval.py train   # Monday -> cic/model.joblib (refuses paths outside cic/)
+nice -n 19 .venv/bin/python cic_eval.py report  # -> cic/results.json (~6 min); keep cic/report.txt via redirect
+```
+
+- Separate model, same code (`anomaly.fit_model`), same 2% FP budget on held-out Monday; Friday never tunes anything. Labels come from the official UNB schedule, not the CIC CSVs. `verify` showed: page times are ADT (**+3h = UTC**); all scan/DDoS traffic arrives from the firewall's inside address **172.16.0.1** (NAT), so scan vs DDoS is told apart by time only. **Deliberate deviation:** every victim <-> 205.174.165.73:8080 flow is Botnet all day (bots beacon every ~100s until capture end; only 736/2,199 are in the official 10:02-11:02 window; reported separately). Windows with no flows (sF, sX, sP, sA, sL, sI, b) are "can't be evaluated". 12 stray 172.16.0.1 flows are unlabelled.
+- Suricata alerts are joined to flows by direction-free 5-tuple + time (flow_id differs per run); on run (a) this agrees with the flow_id join on 7,790/7,804 alerts.
+- **Results:** Monday held-out FP 2.0% (threshold -0.5862); **Friday benign FP 1.8%** (same network four days later: contrast with the domain-shift finding). Anomaly detects 100% of sS/sT/sV/sR scan flows, 82% firewall-on, 99.5% sU, 89% sO; within 0-76s per scan; DDoS only 2.9% of flows (detected at 7s); Botnet ~1% (first flag after 29 min: effectively missed). Suricata with the Pi's HOME_NET misses most scans (172.16.0.1 counts as "home"); with the LAN HOME_NET it catches sS/sT/sV/sR at 0s, firewall-on at 26s and the DDoS by signature (`ET DOS Terse HTTP GET ... AnonMafiaIC`); neither detector catches the botnet by signature. Benign Suricata alerts 1.3% of flows, 0.3% without `SURICATA` stream/decoder events. Analyst load: ~240 benign rows/h from each detector (30s batches, before `collapse()`), more than the Groq free tier could triage if every anomaly batch is a call.
+- The evaluation found `SourceWindow` was O(window) per flow (~15-20 ms/flow during a 30k flows/min scan); fixed to running counts with identical feature vectors (commit 3bf52c9).
+
 ### Step 5 checklist (after collection; rerun for baseline 2)
 
 For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out baseline_uni.jsonl` (then `--baseline baseline_uni.jsonl`) so baseline 1 stays for the thesis. Snapshot within ~a week of the start (logrotate keeps 14 files, rotating daily or at 100 MB). After freezing, delete its broadcast/multicast flows as was done for baseline 1, run `anomaly.py derp-refresh` before training, and use the uni-network Pi/laptop IPs for `make_replay.py`. No scans or tests on the Pi during collection.
