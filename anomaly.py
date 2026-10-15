@@ -7,7 +7,7 @@ Usage:
   anomaly.py derp-refresh    # update tailscale_derp.json from `tailscale debug derp-map`
 """
 import argparse, glob, gzip, ipaddress, json, math, os, re, subprocess, sys, time
-from collections import deque
+from collections import Counter, deque
 from datetime import datetime
 from netinfo import load_recon_marker, recon_covers_dest
 
@@ -143,13 +143,38 @@ def unanswered(e):
     back = e["flow"].get("pkts_toclient", 0)
     return back == 0 or (e["proto"] == "TCP" and back <= 1)
 
+class _Recent:
+    """One source's flows in the window, with running counts so each flow costs O(1)
+    (recounting the window per flow took ~15 ms/flow during a 30k flows/minute scan)."""
+    __slots__ = ("q", "ports", "hosts", "unanswered")
+
+    def __init__(self):
+        self.q = deque()        # (t, dest_ip, dest_port, unanswered)
+        self.ports, self.hosts, self.unanswered = Counter(), Counter(), 0
+
+    def add(self, item):
+        self.q.append(item)
+        self.hosts[item[1]] += 1
+        self.ports[item[2]] += 1
+        self.unanswered += item[3]
+
+    def drop_older(self, cutoff):
+        q = self.q
+        while q[0][0] < cutoff:
+            _, host, port, un = q.popleft()
+            for c, k in ((self.hosts, host), (self.ports, port)):
+                c[k] -= 1
+                if not c[k]:
+                    del c[k]
+            self.unanswered -= un
+
 class SourceWindow:
     """What each source IP did in the last WINDOW seconds, by eve timestamp,
     so training, replay and live scoring compute it identically."""
 
     def __init__(self, seconds=WINDOW):
         self.seconds = seconds
-        self.recent = {}   # src_ip -> deque[(t, dest_ip, dest_port, unanswered)]
+        self.recent = {}   # src_ip -> _Recent
         self.seen = {}     # dedupe key -> t
         self.last_gc = 0
 
@@ -161,26 +186,28 @@ class SourceWindow:
         if key in self.seen:
             return None
         self.seen[key] = t
-        q = self.recent.setdefault(e.get("src_ip"), deque())
-        q.append((t, e.get("dest_ip"), e.get("dest_port"), unanswered(e)))
-        while q[0][0] < t - self.seconds:
-            q.popleft()
+        r = self.recent.get(e.get("src_ip"))
+        if r is None:
+            r = self.recent[e.get("src_ip")] = _Recent()
+        r.add((t, e.get("dest_ip"), e.get("dest_port"), unanswered(e)))
+        r.drop_older(t - self.seconds)
         if t - self.last_gc > self.seconds:
             self._gc(t)
         start, end = parse_ts(f["start"]), parse_ts(f["end"])
         proto = e.get("proto")
+        n = len(r.q)
         return [
             math.log1p(f.get("bytes_toserver", 0)), math.log1p(f.get("bytes_toclient", 0)),
             math.log1p(f.get("pkts_toserver", 0)), math.log1p(f.get("pkts_toclient", 0)),
             max((end - start).total_seconds(), 0.0), port_class(e.get("dest_port")),
             proto == "TCP", proto == "UDP", proto in ("ICMP", "IPv6-ICMP"),
-            len(q), len({x[2] for x in q}), len({x[1] for x in q}), sum(x[3] for x in q) / len(q),
+            n, len(r.ports), len(r.hosts), r.unanswered / n,
         ]
 
     def _gc(self, t):
         cutoff = t - self.seconds
         self.seen = {k: v for k, v in self.seen.items() if v >= cutoff}
-        self.recent = {s: q for s, q in self.recent.items() if q and q[-1][0] >= cutoff}
+        self.recent = {s: r for s, r in self.recent.items() if r.q and r.q[-1][0] >= cutoff}
         self.last_gc = t
 
 def featurize(events, window=None):
