@@ -75,7 +75,9 @@ PDF for a time range (`--since`/`--until`, local time, compared against `seen_at
 - Top findings group rows by signature + verdict + priority (the latest AI reason is shown, via SQLite's bare-column-with-`MAX(id)` rule); benign findings only fill a short list. `unknown` rows are shown as "not AI-reviewed", never as benign.
 - Business impact: thesis definitions of BIA/RTO/RPO are constants in `report.py` (word for word). Asset RTO/RPO values live in `bia.json`, labelled "Example values for a small organization, configurable"; the thesis has no target values.
 
-## Anomaly detection (`anomaly.py`; steps 1-4 done, step 5 pending)
+## Anomaly detection (`anomaly.py`; DISABLED pending baseline 2)
+
+**Status (2026-10-16):** live scoring is **off**. The baseline-1 model was renamed to `anomaly_model.friend.joblib`, so `pipeline.py` logs `anomaly detection off: no anomaly_model.joblib`; signatures + AI triage run as normal. Reason: domain shift (below), which also spent a Groq request almost every 30 s batch (anomalies are never cached). **Baseline 2 is collected on the uni network starting Sunday 2026-10-18**, then the step 5 checklist runs again on it.
 
 Isolation Forest on Suricata `flow` events, as a second detector next to signatures. Phases: collect baseline -> `snapshot` -> train -> live scoring inside `pipeline.py`. Broadcast/multicast destinations are excluded in both training and scoring (`is_broadcast_or_multicast`), since that chatter depends on which network the Pi is on.
 
@@ -83,10 +85,21 @@ Isolation Forest on Suricata `flow` events, as a second detector next to signatu
 - Threshold = false-positive budget (`--fp-budget`, default 2%) on the newest 20% of the baseline, held out from fitting. Attack replays are never used to set it; they are only evaluated with `eval`. Isolation Forest cannot score points beyond the training range as stranger than the most extreme baseline flow, which is why a 0.5% threshold caught nothing.
 - Anomalies are grouped per source IP (a sweep across many hosts is one row).
 - **Allowlist: the Pi's own Tailscale relay traffic** (`is_own_tailscale_relay()`) is excluded from training and scoring, before the per-source window, like broadcast. All three must hold: source MAC is the Pi's wlan0/eth0, destination is a DERP relay IP in `tailscale_derp.json` (176 IPs, `anomaly.py derp-refresh`, then retrain), and UDP 3478 / TCP 443 / TCP 80 / ICMP. Reason: Tailscale probes relays differently per network (baseline hotspot: UDP STUN; 192.168.221.x hotspot: TCP/443 + ICMP to every region), so 74% of the first live flags (2026-10-16) were these probes, and their burst inflated the window for the Pi's other flows. Signatures still see these flows. **Risk:** traffic from the Pi to Tailscale relay servers on those ports is invisible to the anomaly detector (e.g. a compromised Pi using DERP as an exfiltration channel); a relay IP missing from the list is scored (noisy, not blind). Retrained on the baseline only: 1,940 baseline flows excluded; fit 22,752 / calibration 5,689, threshold -0.6103. Replay: holdout FP 2.0%, 1000-port scans 98.6%, slow scan 86%, SSH sweep 0%.
-- **Network shift (open):** even with the allowlist, 61% of the Pi's live flows on the 192.168.221.x hotspot were flagged (174-flow sample right after boot): the Pi's normal minute there touches ~7 ports / 5 hosts (Tailscale port mapper on 5351/1900 answered by the gateway, NAT hairpin probes, HTTPS), versus a baseline 95th percentile of 3 ports. The baseline does not describe this network; a new baseline on the demo network is the fix, not more allowlisting.
 - Test attacks only with `make_replay.py` + `eval` during baseline collection: no live scans until the baseline snapshot is taken.
 
 The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd timer, every ~10 min, `Nice=19`) generates benign DNS lookups, a few HTTPS fetches, and apt update every 6h. **The baseline is therefore partly synthetic**; say so in the thesis. Do not scan or test during the baseline window.
+
+### Thesis finding: domain shift (2026-10-16)
+
+A model trained on one network does not transfer to another. Baseline 1 was recorded on a friend's phone hotspots (192.168.160.x, then 192.168.100.x). On a different hotspot (192.168.221.x) the live model flagged most of the Pi's ordinary traffic:
+
+- Without the Tailscale allowlist: 224 of 295 usable live flows flagged (76%) in the first 6 min after boot; 74% of those were the Pi's own Tailscale relay probes, a behaviour that changes with the network.
+- With the allowlist and a retrained model: **107 of 174 usable flows flagged (61%)**, 00:10-00:19 local, steady across the minutes rather than only right after boot. Every HTTPS flow (25/25) and most Tailscale port-mapper probes (UDP 5351, 32/43) were flagged.
+- Cause: on that network the Pi's normal minute touches a median of 7 ports / 5 hosts and 23% of its flows go unanswered; in baseline 1 the median was 1 port / 2 hosts with 100% unanswered, and 95% of minutes touched 3 ports or fewer. The gateway answers Tailscale's NAT-PMP/SSDP probes there, Tailscale probes its own public IP (hairpin), and so on.
+- Held-out FP on baseline 1 was 2.0% the whole time: the 2% budget only holds on the network the baseline describes.
+- Response: not more allowlisting (that would hide symptoms and widen the blind spot), but a new baseline on the network where the detector is used, and retraining whenever the deployment network changes. Caveat: small sample (one 9-minute window right after a boot).
+
+### Baseline 1 (friend's hotspot, superseded)
 
 **Baseline collection started 2026-10-04T22:32 (+03, Pi local time)**: after MAC logging was enabled and the logrotate tests finished. Earlier flows have no MACs; leave them out. Target: ~2,000 usable flows, 2-3 days (i.e. ~Oct 6-7).
 
@@ -94,7 +107,10 @@ The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd t
 
 **Results (2026-10-16, steps 1-4):** live model: fit 24,304 / calibration 6,077, threshold -0.5980, flags 2.0% of held-out flows (4.2% of fit flows). Replay (`--pi 192.168.100.15 --peer 192.168.100.65`; `replay/` is gitignored, it holds real flows): FP on real holdout 2.4%; detected 991/1000 for both 1000-port scans, 91/100 for the slow scan, **0/50 for the SSH sweep** (likely looks like Tailscale's STUN fan-out to ~70 relays in the baseline; not tuned away, report as a limitation).
 
-### Step 5 checklist (after collection)
+### Step 5 checklist (after collection; rerun for baseline 2)
+
+For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out baseline_uni.jsonl` (then `--baseline baseline_uni.jsonl`) so baseline 1 stays for the thesis. Snapshot within ~a week of the start (logrotate keeps 14 files, rotating daily or at 100 MB). After freezing, delete its broadcast/multicast flows as was done for baseline 1, run `anomaly.py derp-refresh` before training, and use the uni-network Pi/laptop IPs for `make_replay.py`. No scans or tests on the Pi during collection.
+
 
 1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
 2. **Freeze the baseline:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --until <now>` -> `baseline_flows.jsonl`. Record the until-time and flow counts for the thesis.

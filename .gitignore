@@ -2,8 +2,8 @@
 .venv/
 __pycache__/
 pecan.db
-baseline_flows.jsonl
-anomaly_model.joblib
+baseline*.jsonl
+anomaly_model*.joblib
 pecan.db.bak-*
 reports/
 replay/
