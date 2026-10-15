@@ -41,6 +41,7 @@ CACHE_HOURS = 6
 PREVIOUS_DAYS = 7          # how far back a 'previous_verdict' hint may come from
 SAMPLE = 10                  # IPs listed for a collapsed group
 UNTRIAGED = ("unknown", "unknown", "AI unavailable")
+SELF_RECON_TAG = "[self-recon] "  # prefix pipeline.py adds to the Pi's own recon scan alerts
 
 
 def backup(db, path, why):
@@ -88,7 +89,9 @@ def collapse(items):
     out, by_sid = [], {}
     for it in items:
         if it["detection"] == "signature":
-            by_sid.setdefault(it["sid"], []).append(it)
+            # Key on the self-recon tag too, so the Pi's own authorised scan is never merged with
+            # (and never lends its [self-recon] tag to) a real attacker hitting the same rule+host.
+            by_sid.setdefault((it["sid"], it["signature"].startswith(SELF_RECON_TAG)), []).append(it)
         else:
             out.append(it)
     for group in by_sid.values():

@@ -1,6 +1,6 @@
 import json, os, time
 from datetime import datetime, timezone
-from triage import open_db, collapse, cached, triage_all, UNTRIAGED
+from triage import open_db, collapse, cached, triage_all, UNTRIAGED, SELF_RECON_TAG
 from netinfo import host_ips, load_recon_marker, recon_covers_dest
 
 EVE = "/var/log/suricata/eve.json"
@@ -23,7 +23,7 @@ def flush(pending, anomalies, hits):
         slim = {k: e.get(k) for k in ("src_ip", "dest_ip", "dest_port", "proto", "app_proto", "http", "tls", "dns")}
         sig = e["alert"]["signature"]
         if marker and e.get("src_ip") in ours and recon_covers_dest(marker, e.get("dest_ip", "")):
-            sig = "[self-recon] " + sig
+            sig = SELF_RECON_TAG + sig
         slim.update(detection="signature", sid=key[0], signature=sig,
                     severity=e["alert"]["severity"], count=count)
         items.append(slim)
