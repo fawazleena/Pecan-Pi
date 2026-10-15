@@ -87,6 +87,10 @@ The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd t
 
 **Baseline collection started 2026-10-04T22:32 (+03, Pi local time)**: after MAC logging was enabled and the logrotate tests finished. Earlier flows have no MACs; leave them out. Target: ~2,000 usable flows, 2-3 days (i.e. ~Oct 6-7).
 
+**Baseline frozen** (2026-10-04T22:32 -> 2026-10-08T15:40): 70,909 flows; the 40,528 broadcast/multicast flows were then permanently deleted from `baseline_flows.jsonl` (third-party data, promised deletion), leaving 30,381. Training output is identical either way, since `featurize()` drops them before the per-source window. The Pi was 192.168.160.145, then 192.168.100.15 from 2026-10-05T17:41 (all of the newest 20%).
+
+**Results (2026-10-16, steps 1-4):** live model: fit 24,304 / calibration 6,077, threshold -0.5980, flags 2.0% of held-out flows (4.2% of fit flows). Replay (`--pi 192.168.100.15 --peer 192.168.100.65`; `replay/` is gitignored, it holds real flows): FP on real holdout 2.4%; detected 991/1000 for both 1000-port scans, 91/100 for the slow scan, **0/50 for the SSH sweep** (likely looks like Tailscale's STUN fan-out to ~70 relays in the baseline; not tuned away, report as a limitation).
+
 ### Step 5 checklist (after collection)
 
 1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
