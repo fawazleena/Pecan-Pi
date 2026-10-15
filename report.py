@@ -225,6 +225,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
   <div class="tile"><b>{{ vd.get('malicious', (0,0))[0] + vd.get('suspicious', (0,0))[0] }}</b><span>suspicious or malicious</span></div>
   <div class="tile"><b>{{ dt.get('anomaly', (0,0))[0] }}</b><span>anomaly detections</span></div>
   <div class="tile"><b>{{ dt.get('honeypot', (0,0))[0] }}</b><span>honeypot hits (blocked IPs: {{ d.blocked }})</span></div>
+  <div class="tile"><b>{{ dt.get('recon', (0,0))[0] }}</b><span>recon verifications</span></div>
 </div>{% endif %}
 {% for kind, body in summary %}{% if kind == 'p' %}<p>{{ body }}</p>{% else %}<ul>{% for i in body %}<li>{{ i }}</li>{% endfor %}</ul>{% endif %}{% endfor %}
 <p class="badge">{{ source }}</p>
@@ -253,7 +254,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
 <p class="note">Alerts of the same rule, verdict and priority are shown together; the reason is the AI's most recent one.</p>
 <table class="small"><tr><th>Priority</th><th>Verdict</th><th>Finding</th><th>Hosts (latest)</th><th class="n">Alerts / events</th><th>Last seen</th><th>AI reason</th></tr>
 {% for f in d.top %}<tr class="{{ f.priority }}"><td>{{ f.priority }}</td><td>{{ f.verdict }}</td>
-<td>{{ f.signature }}{% if f.detection in ('anomaly', 'honeypot') %} <i>({{ f.detection }})</i>{% endif %}</td>
+<td>{{ f.signature }}{% if f.detection in ('anomaly', 'honeypot', 'recon') %} <i>({{ f.detection }})</i>{% endif %}</td>
 <td>{{ endpoint(f.src, f.n_src) }} → {{ endpoint(f.dst, f.n_dest) }}</td><td class="n">{{ f.rows }} / {{ f.events }}</td>
 <td>{{ show_time(f.last) }}</td><td>{{ f.reason }}</td></tr>{% endfor %}</table>
 {% else %}<p>No AI-reviewed alerts in this period.</p>{% endif %}
@@ -261,6 +262,7 @@ th { font-size: 8.5pt; color: #555; } td.n { text-align: right; white-space: now
 <h2>Technical appendix</h2>
 <ul class="small">
 <li><b>Detection.</b> Suricata IDS on wlan0 and eth0 with the Emerging Threats ruleset plus local rules; SID 9000001 (ICMP echo test rule) is ignored.{% if model %} Anomaly detection: Isolation Forest on flow features{% if model.error %} (model metadata unreadable: {{ model.error }}){% else %}, threshold {{ model.threshold | round(4) }}, false-positive budget {{ model.fp_budget }}%, fitted on {{ model.n_fit }} flows, calibrated on {{ model.n_calib }} held-out flows, {{ model.window }} s source window, scikit-learn {{ model.sklearn }}{% endif %}.{% else %} Anomaly detection: no trained model present when this report was generated.{% endif %}</li>
+<li><b>Reconnaissance.</b> Analyst-initiated, non-destructive VAPT: nmap <code>-sV</code> service/version discovery of an analyst-named target, service versions mapped to known vulnerabilities via the local Exploit-DB (<code>searchsploit</code>, offline; it lists vulns with a public exploit entry, not the full NVD, so no match is not proof of no CVE). Each finding proposes a read-only verification with its reasoning; nothing runs until the analyst approves that finding, and only non-destructive checks (banner grab, version re-confirm) run. Active exploitation is out of scope and disabled.</li>
 <li><b>Prevention.</b> A decoy SSH service listens on a port where no real service runs. A source that completes a connection to it is blocked at wlan0/eth0 with nftables for a fixed time, unless it is the Pi itself, the default gateway, arrived over Tailscale, or is on the allowlist. The block happens at once and does not depend on the AI verdict.</li>
 <li><b>AI triage.</b> {{ model_name }} on Groq. Alerts are batched every 30 s, deduplicated by rule, source and destination, and alerts of the same rule sharing a source or destination are merged ("+N hosts"). A verdict for the same rule and host group from the previous 6 hours is reused (reason starts with <code>[cached]</code>). <code>[backfill]</code> marks verdicts given later from stored fields only, without packet details.</li>
 <li><b>Not AI-reviewed.</b> {{ d.untriaged }} alerts in this period have verdict "unknown" (AI unavailable at the time). They are counted as unknown, never as benign.</li>

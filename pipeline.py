@@ -1,6 +1,7 @@
 import json, os, time
 from datetime import datetime, timezone
 from triage import open_db, collapse, cached, triage_all, UNTRIAGED
+from netinfo import host_ips, load_recon_marker, recon_covers_dest
 
 EVE = "/var/log/suricata/eve.json"
 DB = "pecan.db"
@@ -13,9 +14,17 @@ db = open_db(DB)
 
 def flush(pending, anomalies, hits):
     items = []
+    # While a recon scan runs, Suricata still alerts on the Pi's own nmap. Tag those (don't drop
+    # them: Suricata must not be blinded and the audit trail is kept), so the TUI/report show the
+    # appliance's own authorised scan. marker/ours looked up once per flush, only when a scan is active.
+    marker = load_recon_marker()
+    ours = host_ips() if marker else []
     for key, (e, count) in pending.items():
         slim = {k: e.get(k) for k in ("src_ip", "dest_ip", "dest_port", "proto", "app_proto", "http", "tls", "dns")}
-        slim.update(detection="signature", sid=key[0], signature=e["alert"]["signature"],
+        sig = e["alert"]["signature"]
+        if marker and e.get("src_ip") in ours and recon_covers_dest(marker, e.get("dest_ip", "")):
+            sig = "[self-recon] " + sig
+        slim.update(detection="signature", sid=key[0], signature=sig,
                     severity=e["alert"]["severity"], count=count)
         items.append(slim)
     for g in anomalies:

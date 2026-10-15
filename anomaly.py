@@ -9,6 +9,7 @@ Usage:
 import argparse, glob, gzip, ipaddress, json, math, os, re, subprocess, sys, time
 from collections import deque
 from datetime import datetime
+from netinfo import load_recon_marker, recon_covers_dest
 
 EVE = "/var/log/suricata/eve.json"
 BASELINE = "baseline_flows.jsonl"
@@ -110,9 +111,26 @@ def is_own_tailscale_relay(e):
     macs = (e.get("ether") or {}).get("src_macs") or []
     return any(m.lower() in OWN_MACS for m in macs)
 
+def is_own_recon_scan(e):
+    """Allowlist: the Pi's own reconnaissance scan while recon.py is running.
+
+    The Recon module scans targets the analyst named, from the Pi, so the detector would flag the
+    appliance's own authorised scan. While a scan marker is active, a flow sent from the Pi's own
+    NIC to one of the scan's targets is excluded. Same shape and same blind-spot caveat as the
+    Tailscale allowlist: traffic from the Pi to a current scan target is invisible to the anomaly
+    detector for the scan's duration (signatures still see it, tagged [self-recon] by pipeline.py).
+    Live scoring reads the marker fresh each flow; training/replay use whatever was active then
+    (normally none), so it has no effect on the baseline."""
+    marker = load_recon_marker()
+    if not recon_covers_dest(marker, e.get("dest_ip", "")):
+        return False
+    macs = (e.get("ether") or {}).get("src_macs") or []
+    return any(m.lower() in OWN_MACS for m in macs)
+
+
 def excluded(e):
     """Flows left out of training and scoring (before the per-source window)."""
-    return is_broadcast_or_multicast(e) or is_own_tailscale_relay(e)
+    return is_broadcast_or_multicast(e) or is_own_tailscale_relay(e) or is_own_recon_scan(e)
 
 def port_class(port):
     """Ports are labels, not quantities, so only their range is used."""

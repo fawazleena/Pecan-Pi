@@ -1,8 +1,12 @@
-"""The Pi's current addresses, looked up at call time (hotspot IPs change).
+"""The Pi's current addresses, looked up at call time (hotspot IPs change), and the
+reconnaissance "scan in progress" marker.
 
-Standard library only: used by triage.py and by honeypot.py, which runs sandboxed without the venv.
+Standard library only: used by triage.py and by honeypot.py (which runs sandboxed without the
+venv), and the marker is read by anomaly.py and pipeline.py to suppress the Pi's own scans.
 """
-import subprocess
+import json, os, subprocess, time
+from datetime import datetime, timezone
+from pathlib import Path
 
 
 def run(*cmd):
@@ -26,3 +30,54 @@ def iface_ips(name):
     """Addresses on one interface, without prefix length ('tailscale0 UNKNOWN 100.x/32 fd7a::/128')."""
     fields = run("ip", "-br", "addr", "show", "dev", name).split()
     return [a.split("/")[0] for a in fields[2:]]
+
+
+# --- Reconnaissance scan marker ---------------------------------------------------------------
+# recon.py writes this while it is scanning so the Pi's own detectors don't flag the scan.
+# It is a plain file, not a lock: both detectors only read it, and it is advisory.
+RECON_MARKER = Path(__file__).with_name("recon_active.json")
+RECON_MAX_AGE = 3600   # seconds; a marker older than this is ignored (safety net against a leak)
+RECON_TAIL = 120       # seconds kept active after a scan ends, to cover late flow records
+
+
+def _now():
+    return datetime.now(timezone.utc)
+
+
+def write_recon_marker(scan_id, targets, ports=None):
+    """Start (or extend) the active-scan window. end=None means a scan is running now."""
+    RECON_MARKER.write_text(json.dumps({
+        "scan_id": scan_id, "targets": list(targets), "ports": list(ports) if ports else None,
+        "start": _now().isoformat(), "end": None}))
+
+
+def finish_recon_marker():
+    """Mark the running scan finished; keep it active RECON_TAIL seconds for trailing flows."""
+    m = load_recon_marker(ignore_age=True)
+    if m:
+        m["end"] = (_now().timestamp() + RECON_TAIL)
+        RECON_MARKER.write_text(json.dumps({**m, "end": datetime.fromtimestamp(m["end"], timezone.utc).isoformat()}))
+
+
+def load_recon_marker(ignore_age=False):
+    """The current scan marker, or None if there is none, it is stale, expired or unreadable."""
+    try:
+        m = json.loads(RECON_MARKER.read_text())
+        start = datetime.fromisoformat(m["start"]).timestamp()
+    except (FileNotFoundError, ValueError, KeyError, OSError):
+        return None
+    now = time.time()
+    if not ignore_age and now - start > RECON_MAX_AGE:
+        return None
+    if m.get("end"):
+        try:
+            if now > datetime.fromisoformat(m["end"]).timestamp():
+                return None  # scan finished and the tail has passed
+        except ValueError:
+            return None
+    return m
+
+
+def recon_covers_dest(marker, dest_ip):
+    """True if dest_ip is one of the marker's scan targets (exact IP match on parsed targets)."""
+    return bool(marker) and dest_ip in (marker.get("targets") or [])

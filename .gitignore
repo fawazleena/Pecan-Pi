@@ -7,3 +7,4 @@ anomaly_model*.joblib
 pecan.db.bak-*
 reports/
 replay/
+recon_active.json
