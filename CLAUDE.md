@@ -41,10 +41,11 @@ Files in `deploy/` are copies of what is installed on the Pi; editing them in th
 | `deploy/local.rules` | `/etc/suricata/rules/local.rules` |
 | `deploy/logrotate-suricata` | `/etc/logrotate.d/suricata` |
 | `deploy/pecan-trafficgen.service` / `.timer` | `/etc/systemd/system/` (enable the `.timer`) |
+| `deploy/pecan-logrotate.service` / `.timer` | `/etc/systemd/system/` (enable the `.timer`) |
 
 `/etc/suricata/suricata.yaml` is not in the repo; local change: `ethernet: yes` under eve-log (logs MAC addresses, used by `anomaly.py` to drop broadcast/multicast flows).
 
-The stock logrotate config HUPed a pidfile path our override doesn't use, so Suricata never reopened its logs after rotation; the repo version HUPs via `systemctl kill` and uses `delaycompress`. `pipeline.py` detects rotation (inode change) and truncation and reopens `eve.json`.
+The stock logrotate config HUPed a pidfile path our override doesn't use, so Suricata never reopened its logs after rotation; the repo version HUPs via `systemctl kill` and uses `delaycompress`. It also sets `daily` + `maxsize 100M` (keep 14): with no frequency it inherited `weekly` from `/etc/logrotate.conf`, so eve.json reached 443 MB in 3.7 days (~120 MB/day). The system logrotate runs only once a day, so `pecan-logrotate.timer` runs this one file hourly to enforce the size cap (`Nice=19`, idle I/O). The Pi has no RTC: after it was off 2026-10-08 15:41 -> 10-15 23:57 the journal shows the boot at the old shutdown time until NTP syncs. `pipeline.py` detects rotation (inode change) and truncation and reopens `eve.json`.
 
 After changing one, copy it into place, then `sudo systemctl daemon-reload` and restart the relevant unit (`pecan-pipeline` or `suricata`). Logs: `journalctl -u pecan-pipeline -f`.
 

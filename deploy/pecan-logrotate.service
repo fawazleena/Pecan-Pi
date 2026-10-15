@@ -1,0 +1,8 @@
+[Unit]
+Description=Rotate Suricata logs (size check between the daily system runs)
+
+[Service]
+Type=oneshot
+ExecStart=/usr/sbin/logrotate /etc/logrotate.d/suricata
+Nice=19
+IOSchedulingClass=idle
