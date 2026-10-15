@@ -4,14 +4,17 @@ Usage:
   anomaly.py snapshot --since 2026-10-05 [--until 2026-10-07T18:00] [--out baseline_flows.jsonl]
   nice -n 19 anomaly.py train [--baseline baseline_flows.jsonl] [--fp-budget 2.0] [--out anomaly_model.joblib]
   anomaly.py eval FILE [--model anomaly_model.joblib]
+  anomaly.py derp-refresh    # update tailscale_derp.json from `tailscale debug derp-map`
 """
-import argparse, glob, gzip, ipaddress, json, math, os, re, sys, time
+import argparse, glob, gzip, ipaddress, json, math, os, re, subprocess, sys, time
 from collections import deque
 from datetime import datetime
 
 EVE = "/var/log/suricata/eve.json"
 BASELINE = "baseline_flows.jsonl"
 MODEL = "anomaly_model.joblib"
+DERP = os.path.join(os.path.dirname(os.path.abspath(__file__)), "tailscale_derp.json")
+SNIFFED = ("wlan0", "eth0")   # interfaces Suricata captures on (deploy/override.conf)
 WINDOW = 60             # seconds of per-source history
 FP_BUDGET = 2.0         # % of held-out normal flows we accept being flagged
 CALIB_FRACTION = 0.2    # newest part of the baseline, held out to set the threshold
@@ -68,6 +71,49 @@ def is_broadcast_or_multicast(e):
     # fallback for events logged before ethernet logging was enabled
     return isinstance(ip, ipaddress.IPv4Address) and str(ip).endswith(".255")
 
+def load_derp(path=DERP):
+    """Tailscale DERP relay IPs (public Tailscale infrastructure), from `derp-refresh`."""
+    try:
+        with open(path) as f:
+            return {ipaddress.ip_address(x) for x in json.load(f)["ips"]}
+    except FileNotFoundError:
+        print(f"warning: {path} missing, Tailscale relay flows will be scored", file=sys.stderr)
+        return set()
+
+def own_macs():
+    macs = set()
+    for i in SNIFFED:
+        try:
+            with open(f"/sys/class/net/{i}/address") as f:
+                macs.add(f.read().strip().lower())
+        except OSError:
+            pass
+    return macs
+
+DERP_IPS, OWN_MACS = load_derp(), own_macs()
+RELAY_PORTS = {("UDP", 3478), ("TCP", 443), ("TCP", 80)}   # STUN, DERP over TLS, DERP/HTTP probe
+
+def is_own_tailscale_relay(e):
+    """Allowlist: the Pi's own Tailscale traffic to DERP relays (STUN, DERP, latency probes).
+    How Tailscale probes relays depends on the network (UDP STUN on one hotspot, TCP/443 +
+    ICMP to every region on another), so it is excluded like broadcast chatter. All three
+    must hold: sent from the Pi's own NIC, to a known relay IP, on a relay port/ICMP.
+    Signature detection still sees these flows."""
+    try:
+        if ipaddress.ip_address(e.get("dest_ip", "")) not in DERP_IPS:
+            return False
+    except ValueError:
+        return False
+    proto = e.get("proto")
+    if (proto, e.get("dest_port")) not in RELAY_PORTS and proto not in ("ICMP", "IPv6-ICMP"):
+        return False
+    macs = (e.get("ether") or {}).get("src_macs") or []
+    return any(m.lower() in OWN_MACS for m in macs)
+
+def excluded(e):
+    """Flows left out of training and scoring (before the per-source window)."""
+    return is_broadcast_or_multicast(e) or is_own_tailscale_relay(e)
+
 def port_class(port):
     """Ports are labels, not quantities, so only their range is used."""
     if port is None:
@@ -123,7 +169,7 @@ def featurize(events, window=None):
     """(event, vector) for every usable flow, in order; drops noise and duplicates."""
     window = window or SourceWindow()
     for e in events:
-        if is_broadcast_or_multicast(e):
+        if excluded(e):
             continue
         v = window.features(e)
         if v is not None:
@@ -148,7 +194,7 @@ class Scorer:
         self.buf = []
 
     def add(self, e):
-        if is_broadcast_or_multicast(e):
+        if excluded(e):
             return
         v = self.window.features(e)
         if v is not None:
@@ -218,10 +264,10 @@ def cmd_snapshot(a):
                 continue
             out.write(json.dumps(e) + "\n")
             kept += 1
-            noise += is_broadcast_or_multicast(e)
+            noise += excluded(e)
             first, last = first or t, t
     print(f"read {len(files)} file(s): {', '.join(os.path.basename(p) for p in files)}")
-    print(f"wrote {kept} flows to {a.out} ({kept - noise} usable, {noise} broadcast/multicast excluded)")
+    print(f"wrote {kept} flows to {a.out} ({kept - noise} usable, {noise} broadcast/multicast/Tailscale relay excluded)")
     if first:
         print(f"span: {first.isoformat()} -> {last.isoformat()}")
 
@@ -272,6 +318,15 @@ def cmd_eval(a):
         print(f"  {g['score']:.3f}  {g['src_ip']} -> {g['dest_ip']}  {'/'.join(g['protos'])}  "
               f"ports {g['dest_ports_sample']}{'...' if g['n_dest_ports'] > 10 else ''}\n         {g['summary']}")
 
+def cmd_derp_refresh(a):
+    out = subprocess.run(["tailscale", "debug", "derp-map"], capture_output=True, text=True, check=True).stdout
+    ips = sorted({str(ipaddress.ip_address(n[k])) for r in json.loads(out)["Regions"].values()
+                  for n in r.get("Nodes", []) for k in ("IPv4", "IPv6") if n.get(k)})
+    with open(a.out, "w") as f:
+        json.dump({"generated": datetime.now().astimezone().isoformat(timespec="seconds"),
+                   "source": "tailscale debug derp-map", "ips": ips}, f, indent=1)
+    print(f"wrote {len(ips)} relay IPs to {a.out}; retrain so the model matches")
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -290,6 +345,9 @@ def main():
     v.add_argument("--model", default=MODEL)
     v.add_argument("--top", type=int, default=10)
     v.set_defaults(func=cmd_eval)
+    d = sub.add_parser("derp-refresh", help="update the Tailscale relay allowlist")
+    d.add_argument("--out", default=DERP)
+    d.set_defaults(func=cmd_derp_refresh)
     a = ap.parse_args()
     a.func(a)
 
