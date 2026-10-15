@@ -194,7 +194,8 @@ def featurize(events, window=None):
             yield e, v
 
 def read_jsonl(path):
-    with open(path) as f:
+    opener = gzip.open if path.endswith(".gz") else open
+    with opener(path, "rt") as f:
         for line in f:
             if line.strip():
                 yield json.loads(line)
@@ -289,17 +290,16 @@ def cmd_snapshot(a):
     if first:
         print(f"span: {first.isoformat()} -> {last.isoformat()}")
 
-def cmd_train(a):
+def fit_model(events, fp_budget=FP_BUDGET, baseline=None):
     """Fit on the older part of the baseline; set the threshold on the newer, held-out
     part so that fp_budget % of unseen normal flows would be flagged. Attack replays
-    play no part in this; they are evaluated separately with `eval`."""
-    import joblib, numpy as np, sklearn
+    play no part in this; they are evaluated separately with `eval`. `events` must be
+    sorted by timestamp. Returns (bundle, held-out FP rate, training FP rate)."""
+    import numpy as np, sklearn
     from sklearn.ensemble import IsolationForest
-    t0 = time.time()
-    events = sorted(read_jsonl(a.baseline), key=lambda e: parse_ts(e["timestamp"]))
     X = np.array([v for _, v in featurize(events)], dtype=float)  # windows stay continuous across the split
     if len(X) < 100:
-        sys.exit(f"only {len(X)} usable flows in {a.baseline}; collect more")
+        sys.exit(f"only {len(X)} usable flows in {baseline}; collect more")
     if len(X) < MIN_BASELINE:
         print(f"warning: {len(X)} usable flows, below the {MIN_BASELINE} target")
     cut = int(len(X) * (1 - CALIB_FRACTION))
@@ -307,13 +307,22 @@ def cmd_train(a):
     model = IsolationForest(n_estimators=200, max_samples=min(256, len(fit)), random_state=42, n_jobs=1)
     model.fit(fit)
     calib_scores = model.score_samples(calib)
-    threshold = float(np.percentile(calib_scores, a.fp_budget))
-    fit_fp = (model.score_samples(fit) < threshold).mean()
-    joblib.dump({"model": model, "features": FEATURES, "threshold": threshold, "window": WINDOW,
-                 "fp_budget": a.fp_budget, "sklearn": sklearn.__version__,
-                 "baseline": os.path.abspath(a.baseline), "n_fit": len(fit), "n_calib": len(calib)}, a.out)
-    print(f"fit on {len(fit)} flows, calibrated on {len(calib)} held-out flows, {time.time() - t0:.1f}s -> {a.out}")
-    print(f"threshold {threshold:.4f}: flags {(calib_scores < threshold).mean():.1%} of held-out normal flows "
+    threshold = float(np.percentile(calib_scores, fp_budget))
+    fit_fp = float((model.score_samples(fit) < threshold).mean())
+    calib_fp = float((calib_scores < threshold).mean())
+    bundle = {"model": model, "features": FEATURES, "threshold": threshold, "window": WINDOW,
+              "fp_budget": fp_budget, "sklearn": sklearn.__version__,
+              "baseline": os.path.abspath(baseline) if baseline else None, "n_fit": len(fit), "n_calib": len(calib)}
+    return bundle, calib_fp, fit_fp
+
+def cmd_train(a):
+    import joblib
+    t0 = time.time()
+    events = sorted(read_jsonl(a.baseline), key=lambda e: parse_ts(e["timestamp"]))
+    bundle, calib_fp, fit_fp = fit_model(events, a.fp_budget, a.baseline)
+    joblib.dump(bundle, a.out)
+    print(f"fit on {bundle['n_fit']} flows, calibrated on {bundle['n_calib']} held-out flows, {time.time() - t0:.1f}s -> {a.out}")
+    print(f"threshold {bundle['threshold']:.4f}: flags {calib_fp:.1%} of held-out normal flows "
           f"(budget {a.fp_budget}%), {fit_fp:.1%} of training flows")
 
 def cmd_eval(a):
