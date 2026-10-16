@@ -24,7 +24,7 @@ nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Fores
 .venv/bin/python make_replay.py SNAPSHOT --pi <pi-ip> --peer <laptop-ip> --out-dir replay   # offline attack replays (no network traffic)
 sudo python3 honeypot.py list | unblock IP | unblock-all   # current honeypot blocks (nftables table inet pecan)
 python3 honeypot.py serve --dry-run --port 2223          # decoy without firewall changes (service must not hold the port)
-.venv/bin/python recon.py discover 192.168.221.65        # VAPT: nmap -sV a target the analyst names (never auto-scanned)
+sudo .venv/bin/python recon.py discover 192.168.221.65   # VAPT: nmap -sV a target the analyst names (never auto-scanned)
 .venv/bin/python recon.py review [--scan N]              # list findings + proposed non-destructive check + reasoning
 sudo .venv/bin/python recon.py approve <finding_id>      # run ONLY that finding's read-only check, then triage it
 sudo .venv/bin/python recon.py decline <finding_id> [--note ...]
@@ -94,6 +94,8 @@ The thesis's outward-looking module and its only active capability. Analyst-init
 2. **CVE match:** per `(product, version)`, `searchsploit --cve -j` against the local Exploit-DB. **Offline and already on Kali.** Provenance caveat (stated in the reasoning and report): Exploit-DB lists vulns that have a public exploit entry, each CVE-tagged; it is NOT the full NVD, so no match is not proof of no CVE. `match_cves()` has a `# TODO NVD:` seam to add a local NVD CPE cache later. `vulners.nse` is deliberately NOT used: it calls vulners.com per scan (not offline, phones home).
 3. **Gate + XAI:** each finding is stored `status='proposed'` with a proposed non-destructive action and a **deterministic, rule-based** reasoning string (not an LLM, so the explanation is reproducible). `recon.py review` prints them; nothing runs until `approve <id>`.
 4. **On approval:** only the proposed read-only check runs — `banner_grab` (read a banner, send nothing) or `version_reconfirm` (one `nmap -sV` on that port). `default_creds` is **registered as a non-destructive action but its body is `NotImplementedError` (TODO)** — a seam, not built. The confirmed finding is run through the same Groq triage and stored as an `alerts` row `detection='recon'` (like `backfill.py`; never cached). The AI verdict explains; it does not gate (the analyst already did).
+
+**Live test passed (2026-10-16, scan 1):** `discover 192.168.221.65` (the Mint laptop) took ~25 s, 1 host up, 1 open port of the top 1000: 22/tcp OpenSSH 9.6p1 Ubuntu 3ubuntu13.16, no Exploit-DB match, proposed `banner_grab`. Suricata `kernel_drops` 1074 before and after (cumulative counter, unchanged). No Suricata alert fired for the scan, so nothing was tagged `[self-recon]`: Pi and laptop are both in the default HOME_NET, and scan rules match `$EXTERNAL_NET -> $HOME_NET` (same effect as in the CIC eval). `approve 1` read `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.16` (matches nmap), finding -> `verified`; alerts row 3433 `detection=recon`, AI `benign`/`low`.
 
 **Exploitation seam (out of scope, not built):** `ALLOW_DESTRUCTIVE` is hardcoded `False` with no env/flag/setter that changes it. Actions live in an `ACTIONS` registry holding only `destructive=False` entries, and `dispatch()` refuses anything `destructive=True`. Two independent locks: the registry has no destructive action today, and the gate would block it anyway. Adding active exploitation later is a deliberate change in two visible places.
 

@@ -21,7 +21,7 @@ Written for groupmates who did not see the build. Technical terms are explained 
 - **Reporting**: a PDF report for any date range, with an executive summary, business impact (BIA/RTO/RPO), counts, top findings and a technical appendix.
 - **Anomaly detection (Isolation Forest)**: code, training and evaluation finished. Tested offline (replayed attacks) and on the public CIC-IDS2017 dataset. **Live scoring is switched off** (see Pending and Section 5.6).
 - **Honeypot + automated prevention**: fake SSH service on port 2222 that blocks anyone who connects, using the Pi's own firewall (nftables). Live test passed on 2026-10-16.
-- **Reconnaissance / VAPT**: analyst-started, non-destructive nmap scan, offline CVE matching, and an approve/decline gate for each finding. Code finished; see Section 5.8 for what has and has not been tested.
+- **Reconnaissance / VAPT**: analyst-started, non-destructive nmap scan, offline CVE matching, and an approve/decline gate for each finding. Live test against our own laptop passed 2026-10-16 (Section 5.8).
 - **CIC-IDS2017 evaluation** of both detectors (signatures and anomaly), plus a performance fix it uncovered.
 - **Log rotation fix** so Suricata's log cannot fill the SD card.
 
@@ -332,7 +332,19 @@ vulnerabilities, without harming it. It is the only module that sends traffic to
 - **Offline CVE data:** `vulners.nse` was rejected because it contacts vulners.com on every scan.
 - **Self-recon suppression:** while a scan runs, the anomaly detector ignores the Pi's flows to the target, and Suricata alerts from it are *tagged* `[self-recon]` (not dropped). A real attacker's alert in the same batch is never merged into the tagged row (bug found and fixed, commit 9919d6c).
 
-**Measured results.** None yet. On the snapshot date the live database had no `recon_scan` table, i.e. `recon.py` had not been run against a target on the Pi. Test it before the demo and record the results (finding count, `kernel_drops` before/after).
+**Measured results.** Live test against our own Linux Mint laptop (192.168.221.65), 2026-10-16:
+
+| Step | Result |
+|---|---|
+| `discover` (scan 1) | ~25 s; 1 host up; 1 open port of the top 1000: **22/tcp, OpenSSH 9.6p1 Ubuntu 3ubuntu13.16** (`cpe:/a:openbsd:openssh:9.6p1`) |
+| CVE match | No Exploit-DB entry for this version (stated in the reasoning as *not* proof of no CVE) |
+| Proposed check | `banner_grab`, status `proposed` until approval |
+| Suricata `kernel_drops` | **1074 before, 1074 after**: the scan cost Suricata no packets (the counter is a running total since Suricata started) |
+| Suricata alerts caused by the scan | **None**, so nothing needed the `[self-recon]` tag. Pi and laptop are both private addresses, so both count as HOME_NET, and scan rules only match outside -> inside (the HOME_NET effect, Section 6.4) |
+| `approve 1` | Banner read: `SSH-2.0-OpenSSH_9.6p1 Ubuntu-3ubuntu13.16`, matching nmap's version; finding -> `verified`, decided by `analyst` |
+| AI triage | Stored as alerts row 3433, `detection=recon`; Groq verdict **benign / low**: "authorized SSH banner grab of known OpenSSH version." One Groq request used |
+
+Not yet tested live: a target where Exploit-DB *does* match a CVE, the `version_reconfirm` action, and `decline`.
 
 **Known limitations.**
 - Exploit-DB is **not** the full NVD: "no match" does not mean "no CVE". There is a code seam for adding a local NVD cache later.
@@ -447,7 +459,7 @@ thresholds (commit 3bf52c9).
 | 3.2 Tech Stack | Replace with the table in Section 3 (Kali, Groq gpt-oss-120b, 8 GB, Suricata 8.0.7, Tailscale, SQLite, Textual, WeasyPrint, scikit-learn, nftables, nmap/searchsploit). |
 | Design diagrams (ERD, DFD, UML) | Redraw (Section 8). |
 | **New: Implementation chapter** | Architecture (Section 4), per-module "how it works" and "design decisions" (Section 5), deployment (systemd services, log rotation fix), security hardening of the honeypot service. |
-| **New: Results / Evaluation chapter** | Section 6: baseline 1 and replay results, domain shift, CIC-IDS2017 tables, honeypot live test, verdict-consistency fix, backfill numbers, performance fix. Leave placeholders for uni baseline, live tests, Cisco SPAN lab, demo. |
+| **New: Results / Evaluation chapter** | Section 6: baseline 1 and replay results, domain shift, CIC-IDS2017 tables, honeypot and recon live tests, verdict-consistency fix, backfill numbers, performance fix. Leave placeholders for uni baseline, live tests, Cisco SPAN lab, demo. |
 | **New: Limitations / Discussion** | Every "Known limitations" list in Section 5; HOME_NET effect; partly synthetic baseline; Tailscale blind spots. |
 | Ethics section | Section 9. |
 | Future work | NVD cache for recon, `default_creds` check, retraining per network, better handling of slow/beaconing threats (botnet), paid AI tier or local model for analyst load. |

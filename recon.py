@@ -12,14 +12,15 @@ Active exploitation is OUT OF SCOPE and not built. The action registry holds onl
 non-destructive actions, and ALLOW_DESTRUCTIVE is hardcoded False with no code path that
 changes it, so a destructive action cannot run even if one were added by mistake.
 
-  .venv/bin/python recon.py discover 192.168.221.65        # host, hosts, or CIDR
+  sudo .venv/bin/python recon.py discover 192.168.221.65   # host, hosts, or CIDR
   .venv/bin/python recon.py review [--scan N]
   sudo .venv/bin/python recon.py approve <finding_id>
   sudo .venv/bin/python recon.py decline <finding_id> [--note ...]
   .venv/bin/python recon.py scans
 
-discover/review are read-only (normal user). approve/decline write the root-owned pecan.db, so
-they need sudo, like backfill.py.
+discover/approve/decline write the root-owned pecan.db, so they need sudo, like backfill.py.
+review/scans only read it, so they run as a normal user once the recon tables exist (the first
+discover creates them).
 """
 import argparse, json, socket, subprocess, sys, tempfile
 from datetime import datetime, timezone
