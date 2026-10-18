@@ -11,6 +11,7 @@ from pathlib import Path
 from jinja2 import Environment
 
 from anomaly import local_time
+from netinfo import load_settings
 
 HERE = Path(__file__).parent
 DB = HERE / "pecan.db"
@@ -302,6 +303,9 @@ def main():
     bia = load_bia()
     summary, impact = fallback_text(d, bia, period)
     source = "Automatic summary (AI not used)."
+    if not a.no_ai and not load_settings()[0]["ai"]:   # panel switch "Explain alerts in plain English"
+        a.no_ai = True
+        source = "Automatic summary (AI explanations are switched off)."
     if not a.no_ai and d["groups"]:
         try:
             summary, impact = ai_text(d, bia, period)

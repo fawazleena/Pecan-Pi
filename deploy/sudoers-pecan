@@ -1,0 +1,5 @@
+# /etc/sudoers.d/pecan (install: sudo install -o root -g root -m 0440 deploy/sudoers-pecan /etc/sudoers.d/pecan,
+# then check with: sudo visudo -cf /etc/sudoers.d/pecan)
+# The panel (running as raven) may run exactly one root program, without a password: the
+# root-owned helper, which validates its own arguments. env_reset stays on (sudo default).
+raven ALL=(root) NOPASSWD: /usr/local/sbin/pecan-helper

@@ -1,7 +1,7 @@
 import json, os, time
 from datetime import datetime, timezone
 from triage import open_db, collapse, cached, triage_all, UNTRIAGED, SELF_RECON_TAG
-from netinfo import host_ips, load_recon_marker, recon_covers_dest
+from netinfo import host_ips, load_recon_marker, recon_covers_dest, load_settings
 
 EVE = "/var/log/suricata/eve.json"
 DB = "pecan.db"
@@ -9,6 +9,7 @@ BATCH_SECONDS = 30
 IGNORE_SIDS = {9000001}  # ping test rule
 ANOMALY_MODEL = "anomaly_model.joblib"
 HONEYPOT_LOG = "/var/log/pecan/honeypot.json"  # written by honeypot.py (pecan-honeypot.service)
+AI_OFF = ("unknown", "unknown", "AI explanations off")  # not 'AI unavailable': backfill.py must skip these
 
 db = open_db(DB)
 
@@ -41,10 +42,12 @@ def flush(pending, anomalies, hits):
     for n, it in enumerate(items):
         it["n"] = n
     now = datetime.now(timezone.utc).isoformat()
-    results = cached(db, items, now)
-    results.update(triage_all([it for it in items if it["n"] not in results]))
+    results = {}
+    if settings["ai"]:
+        results = cached(db, items, now)
+        results.update(triage_all([it for it in items if it["n"] not in results]))
     for it in items:
-        verdict, priority, reason = results.get(it["n"], UNTRIAGED)
+        verdict, priority, reason = results.get(it["n"], UNTRIAGED if settings["ai"] else AI_OFF)
         db.execute(
             "INSERT INTO alerts (seen_at, sid, signature, severity, src_ip, dest_ip, count, verdict, priority, reason, "
             "detection, score, n_src, n_dest, group_key, action) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -62,7 +65,7 @@ def handle(line, pending):
         e = json.loads(line)
     except json.JSONDecodeError:
         return
-    if e.get("event_type") == "alert" and e["alert"]["signature_id"] not in IGNORE_SIDS:
+    if e.get("event_type") == "alert" and settings["signatures"] and e["alert"]["signature_id"] not in IGNORE_SIDS:
         key = (e["alert"]["signature_id"], e.get("src_ip"), e.get("dest_ip"))
         old = pending.get(key)
         pending[key] = (old[0], old[1] + 1) if old else (e, 1)
@@ -130,16 +133,37 @@ pending, hits = {}, {}
 eve = Tail(EVE, lambda line: handle(line, pending), wait=True)
 honeypot = Tail(HONEYPOT_LOG, lambda line: handle_hit(line, hits))
 
-scorer = None
-if os.path.exists(ANOMALY_MODEL):
-    try:
-        from anomaly import Scorer
-        scorer = Scorer(ANOMALY_MODEL)
-        print("anomaly detection on")
-    except Exception as err:
-        print("anomaly detection off:", err)
-else:
-    print(f"anomaly detection off: no {ANOMALY_MODEL}")
+settings, scorer, settings_error = None, None, None
+
+def apply_settings():
+    """Re-read the panel's switches (/etc/pecan/settings.json); log changes, load or drop the Scorer.
+    Signature detection off: Suricata keeps running (its flows feed the anomaly detector), the
+    pipeline just ignores its alerts. AI off: rows are stored as AI_OFF, nothing goes to Groq."""
+    global settings, scorer, settings_error
+    new, error = load_settings()
+    if error and error != settings_error:
+        print(f"settings unreadable, keeping everything on: {error}")
+    settings_error = error
+    if new == settings:
+        return
+    old, settings = settings, new
+    print("switches: " + ", ".join(f"{k}={'on' if v else 'off'}" for k, v in new.items()))
+    if old and new["anomaly"] == old["anomaly"]:
+        return
+    scorer = None
+    if not new["anomaly"]:
+        print("anomaly detection off: switched off in the panel")
+    elif os.path.exists(ANOMALY_MODEL):
+        try:
+            from anomaly import Scorer
+            scorer = Scorer(ANOMALY_MODEL)  # a fresh 60 s source window: no stale state from before
+            print("anomaly detection on")
+        except Exception as err:
+            print("anomaly detection off:", err)
+    else:
+        print(f"anomaly detection off: no {ANOMALY_MODEL}")
+
+apply_settings()
 
 last_flush = time.time()
 print("Pecan Pi pipeline running...")
@@ -163,4 +187,5 @@ while True:
             flush(pending, anomalies, hits)
         pending.clear()  # cleared, not rebound: the Tail handlers hold these dicts
         hits.clear()
+        apply_settings()
         last_flush = time.time()

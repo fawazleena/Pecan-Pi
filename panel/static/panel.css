@@ -48,8 +48,10 @@ button.link { background: transparent; color: var(--blue); padding: 6px 10px; }
 
 /* sidebar */
 .side h2:not(:first-child) { margin-top: 24px; }
-.switch-row { display: flex; justify-content: space-between; align-items: center; padding: 10px 0; border-bottom: 1px solid rgba(15,39,71,.08); }
-.switch-row.disabled { opacity: .5; }
+.switch-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; width: 100%; text-align: left;
+  padding: 10px 0; border-radius: 0; background: transparent; color: var(--ink); border-bottom: 1px solid rgba(15,39,71,.08); }
+.switch-row:disabled { opacity: .5; cursor: default; }
+.switch-row:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 .switch { width: 40px; height: 22px; border-radius: 11px; background: #b9cdef; position: relative; flex: none; }
 .switch::after { content: ""; position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #fff; }
 .switch.on { background: var(--blue); }

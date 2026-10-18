@@ -16,12 +16,15 @@
     <h2>Protection</h2>
     <div id="switches">
       {% for w in s.switches %}
-      <div class="switch-row disabled">
+      <button type="button" class="switch-row" role="switch" data-name="{{ w.name }}"
+              aria-checked="{{ 'true' if w.on else 'false' }}"{{ ' disabled' if not w.available }}>
         <span>{{ w.label }}{% if w.note %}<br><span class="muted small">{{ w.note }}</span>{% endif %}</span>
-        <span class="switch{{ ' on' if w.on }}" role="img" aria-label="{{ 'On' if w.on else 'Off' }}"></span>
-      </div>
+        <span class="switch{{ ' on' if w.on }}"></span>
+      </button>
       {% endfor %}
     </div>
+    <p id="switch-msg" class="error small" role="alert"></p>
+    <p class="muted small">Changes take effect within 30 seconds and stay after a restart.</p>
     <p id="settings-error" class="error small it-only">{{ s.settings_error or '' }}</p>
     <h2>Services</h2>
     <ul id="services" class="services">

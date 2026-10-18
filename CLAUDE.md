@@ -50,6 +50,10 @@ Files in `deploy/` are copies of what is installed on the Pi; editing them in th
 | `deploy/pecan-logrotate.service` / `.timer` | `/etc/systemd/system/` (enable the `.timer`) |
 | `deploy/pecan-honeypot.service` | `/etc/systemd/system/pecan-honeypot.service` (enable it) |
 | `deploy/logrotate-pecan` | `/etc/logrotate.d/pecan` |
+| `pecan-helper.py` | `/usr/local/sbin/pecan-helper` (`install -o root -g root -m 0755`, a copy, never a symlink) |
+| `deploy/sudoers-pecan` | `/etc/sudoers.d/pecan` (`install -m 0440`, then `visudo -cf`) |
+
+Panel main switches live in `/etc/pecan/settings.json` (root-owned, written only by `pecan-helper set-switch`, log: `journalctl -t pecan-helper`). `netinfo.load_settings()`: missing file/key = on; unreadable = on + error. Re-read by `pipeline.py` every flush (signatures, anomaly, AI: off stores `AI explanations off`, which `backfill.py` skips), by `honeypot.py` every hit (auto_block) and by `report.py` (AI off = `--no-ai`). No restart needed.
 
 `/etc/suricata/suricata.yaml` is not in the repo; local change: `ethernet: yes` under eve-log (logs MAC addresses, used by `anomaly.py` to drop broadcast/multicast flows).
 

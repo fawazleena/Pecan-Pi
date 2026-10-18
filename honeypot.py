@@ -1,7 +1,8 @@
 """Decoy SSH service with automatic, reversible nftables blocking (the prevention part of the IDPS).
 
 Nothing legitimate runs on the decoy port, so any completed connection to it is unsolicited.
-On each connection: block the source at wlan0/eth0 (unless allowlisted), send a real-looking
+On each connection: block the source at wlan0/eth0 (unless allowlisted or auto-blocking is
+switched off in the panel), send a real-looking
 OpenSSH banner, read at most READ_BYTES of the client's reply, close. There is no authentication,
 no shell and no parsing: attacker bytes are only stored, truncated and made printable.
 Each hit is appended as one JSON line to honeypot.json, which pipeline.py tails for AI triage.
@@ -15,7 +16,7 @@ the table, which lifts every block.
 import argparse, asyncio, ipaddress, json, os, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
-from netinfo import host_ips, gateways, iface_ips
+from netinfo import host_ips, gateways, iface_ips, load_settings
 
 PORT = 2222
 BLOCK_SECONDS = int(os.environ.get("PECAN_BLOCK_SECONDS", 3600))
@@ -138,6 +139,8 @@ async def serve(port, seconds, dry_run):
         why = await asyncio.to_thread(allowlisted, src, dst)
         if why:
             action = f"not blocked: allowlisted ({why})"
+        elif not load_settings()[0]["auto_block"]:   # panel switch, re-read at every hit
+            action = "not blocked: auto-blocking off"
         elif dry_run:
             action = f"dry run: would block {seconds}s"
         else:

@@ -1,7 +1,7 @@
 """Pecan Pi control panel: a small Flask app for a non-technical owner, served over HTTPS.
 
-Phase 1: login, layout, status page. Reads pecan.db read-only and runs as the normal user;
-nothing here needs root yet (later phases go through the root-owned pecan-helper).
+Reads pecan.db read-only and runs as the normal user. Anything that needs root goes through
+the root-owned pecan-helper (one sudoers line, fixed subcommands, argv only, never a shell).
 
     .venv/bin/python panel.py set-password     # store the admin password hash + secret key in .env
     .venv/bin/python panel.py make-cert        # self-signed TLS cert -> panel/tls/ (gitignored)
@@ -22,6 +22,7 @@ DB = HERE / "pecan.db"
 MODEL = HERE / "anomaly_model.joblib"   # pipeline.py's ANOMALY_MODEL (its working dir is HERE)
 EVE = "/var/log/suricata/eve.json"
 TLS = HERE / "panel" / "tls"
+HELPER = "/usr/local/sbin/pecan-helper"   # installed copy of pecan-helper.py, root:root 0755
 SERVICES = ("suricata", "pecan-pipeline", "pecan-honeypot")
 PORT = 8443
 IDLE_MINUTES = 30          # logged out after this long without a page load or change (polling doesn't count)
@@ -36,6 +37,10 @@ PLAIN_DETECTION = {"signature": "Rule match", "anomaly": "Unusual behaviour",
 NORMAL_VERDICTS = ("benign", "normal")   # hidden in Simple mode
 SWITCH_LABELS = {"signatures": "Watch for known attacks", "anomaly": "Spot unusual behaviour",
                  "auto_block": "Block intruders automatically", "ai": "Explain alerts in plain English"}
+OFF_NOTES = {"signatures": "Off: alerts for known attacks are ignored. The network is still watched for unusual behaviour.",
+             "anomaly": "Off: unusual behaviour is not checked.",
+             "auto_block": "Off: visits to the trap door are recorded, but nobody is blocked. Existing blocks run out on their own.",
+             "ai": "Off: alerts are stored without an explanation and nothing is sent to the AI service."}
 CACHE_PREFIXES = ("[cached] ", "[backfill] ", "[retriage] ")
 
 load_dotenv(ENV)
@@ -174,8 +179,8 @@ def plain_kind(detection, verdict):
 def switches():
     """The real state of each main switch, from /etc/pecan/settings.json."""
     settings, error = load_settings()
-    out = [{"name": k, "label": SWITCH_LABELS[k], "on": settings[k], "available": True, "note": ""}
-           for k in SWITCH_LABELS]
+    out = [{"name": k, "label": SWITCH_LABELS[k], "on": settings[k], "available": True,
+            "note": "" if settings[k] else OFF_NOTES[k]} for k in SWITCH_LABELS]
     if not MODEL.exists():   # the pipeline can't score without a model, whatever the setting says
         out[1].update(on=False, available=False,
                       note="Not available yet: still learning what normal looks like on this network.")
@@ -221,6 +226,11 @@ def status():
         problems.append(("red", "Alert processing is stopped."))
     if threats:
         problems.append(("red", f"{threats} serious threat{'s' * (threats > 1)} in the last hour."))
+    on = {w["name"]: w["on"] for w in sw}
+    if not on["signatures"]:
+        problems.append(("yellow", "Watching for known attacks is switched off."))
+    if not on["auto_block"]:
+        problems.append(("yellow", "Automatic blocking is switched off."))
     if states["pecan-honeypot"] != "active":
         problems.append(("yellow", "The trap door (automatic blocking) is stopped."))
     if time.time() - drops["rose_at"] < DROPS_WINDOW:
@@ -252,6 +262,31 @@ def home():
 @app.get("/api/status")
 def api_status():
     return jsonify(status())
+
+
+# --- switches -------------------------------------------------------------------------------
+def helper(*args):
+    """Run one fixed pecan-helper subcommand as root. (ok, message). -n: never prompt for a password."""
+    try:
+        r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired) as err:
+        return False, str(err)
+    return r.returncode == 0, (r.stderr or r.stdout).strip()
+
+
+@app.post("/api/switch")
+def api_switch():
+    body = request.get_json(silent=True) or {}
+    name, on = body.get("name"), body.get("on")
+    if name not in SWITCH_LABELS or not isinstance(on, bool):   # only the four fixed names reach argv
+        abort(400)
+    if name == "anomaly" and not MODEL.exists():
+        return jsonify(error="Not available yet: there is no trained model."), 409
+    ok, msg = helper("set-switch", name, "on" if on else "off")
+    print(f"switch {name}={'on' if on else 'off'} from {request.remote_addr}: {'ok' if ok else msg}")
+    if not ok:
+        return jsonify(error=f"The Pi couldn't change this setting ({msg[:200]})."), 500
+    return jsonify(switches=switches()[0])
 
 
 # --- setup commands ---------------------------------------------------------------------------

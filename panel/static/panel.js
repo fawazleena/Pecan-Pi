@@ -20,16 +20,45 @@ function setMode(m) {
 }
 
 function renderSwitches(list) {
+  if (busy) return;   // don't redraw under a click that is still being saved
   document.getElementById("switches").replaceChildren(...list.map(w => {
-    const row = el("div", "switch-row disabled");
+    const row = el("button", "switch-row");
+    row.type = "button";
+    row.dataset.name = w.name;
+    row.setAttribute("role", "switch");
+    row.setAttribute("aria-checked", w.on ? "true" : "false");
+    row.disabled = !w.available;
     const label = el("span", "", w.label);
     if (w.note) { label.append(el("br"), el("span", "muted small", w.note)); }
-    const sw = el("span", "switch" + (w.on ? " on" : ""));
-    sw.setAttribute("role", "img");
-    sw.setAttribute("aria-label", w.on ? "On" : "Off");
-    row.append(label, sw);
+    row.append(label, el("span", "switch" + (w.on ? " on" : "")));
     return row;
   }));
+}
+
+let busy = false;
+async function toggle(row) {
+  const on = row.getAttribute("aria-checked") !== "true";
+  const label = row.firstChild.textContent;
+  if (!on && !confirm(`Turn off "${label}"?`)) return;
+  const msg = document.getElementById("switch-msg");
+  msg.textContent = "";
+  busy = true;
+  row.disabled = true;
+  try {
+    const r = await fetch("/api/switch", {
+      method: "POST", credentials: "same-origin",
+      headers: { "Content-Type": "application/json",
+                 "X-CSRFToken": document.querySelector('meta[name="csrf-token"]').content },
+      body: JSON.stringify({ name: row.dataset.name, on }) });
+    if (r.status === 401) { location.href = "/login"; return; }
+    const body = await r.json().catch(() => ({}));
+    if (!r.ok) msg.textContent = body.error || "Couldn't change the setting.";
+  } catch (e) {
+    msg.textContent = "Can't reach the Pi. Nothing was changed.";
+  } finally {
+    busy = false;
+    refresh();   // redraw from the real state on the Pi, whatever happened
+  }
 }
 
 function render(s) {
@@ -75,6 +104,10 @@ async function refresh() {
   }
 }
 
+document.getElementById("switches").addEventListener("click", e => {
+  const row = e.target.closest(".switch-row");
+  if (row && !row.disabled && !busy) toggle(row);
+});
 document.querySelectorAll(".mode button").forEach(b => b.addEventListener("click", () => setMode(b.dataset.mode)));
 let saved = "simple";
 try { saved = localStorage.getItem("pecan-mode") || "simple"; } catch (e) { /* default */ }
