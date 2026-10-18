@@ -75,11 +75,13 @@ function render(s) {
   document.getElementById("drops").textContent = s.kernel_drops;
   renderSwitches(s.switches);
   document.getElementById("settings-error").textContent = s.settings_error || "";
-  // Simple mode leaves out rows the AI judged normal and says how many; IT mode shows everything.
+  // Simple mode leaves out rows the AI judged normal or hasn't explained, and says how many of
+  // each; IT mode shows everything.
   const simple = mode === "simple";
-  const n = s.hidden_last_hour;
-  document.getElementById("hidden").textContent =
-    simple && n ? `${n} normal event${n === 1 ? "" : "s"} hidden (last hour)` : "";
+  const n = s.hidden_last_hour, u = s.unexplained_last_hour;
+  document.getElementById("hidden").textContent = simple ? [
+    n ? `${n} normal event${n === 1 ? "" : "s"} hidden (last hour)` : "",
+    u ? `${u} alert${u === 1 ? "" : "s"} not yet explained (last hour)` : ""].filter(Boolean).join(" · ") : "";
   document.getElementById("feed").replaceChildren(...(simple ? s.simple_feed : s.feed).map(f => {
     const li = el("li", f.verdict);
     li.append(el("div", "meta", `${f.time} · ${f.kind} · ${f.plain_verdict}`));

@@ -147,21 +147,24 @@ def apply_settings():
     if new == settings:
         return
     old, settings = settings, new
-    print("switches: " + ", ".join(f"{k}={'on' if v else 'off'}" for k, v in new.items()))
-    if old and new["anomaly"] == old["anomaly"]:
-        return
-    scorer = None
-    if not new["anomaly"]:
-        print("anomaly detection off: switched off in the panel")
-    elif os.path.exists(ANOMALY_MODEL):
-        try:
-            from anomaly import Scorer
-            scorer = Scorer(ANOMALY_MODEL)  # a fresh 60 s source window: no stale state from before
-            print("anomaly detection on")
-        except Exception as err:
-            print("anomaly detection off:", err)
-    else:
-        print(f"anomaly detection off: no {ANOMALY_MODEL}")
+    if not (old and new["anomaly"] == old["anomaly"]):
+        scorer = None
+        if not new["anomaly"]:
+            print("anomaly detection off: switched off in the panel")
+        elif os.path.exists(ANOMALY_MODEL):
+            try:
+                from anomaly import Scorer
+                scorer = Scorer(ANOMALY_MODEL)  # a fresh 60 s source window: no stale state from before
+                print("anomaly detection on")
+            except Exception as err:
+                print("anomaly detection off:", err)
+        else:
+            print(f"anomaly detection off: no {ANOMALY_MODEL}")
+    # The switch can be on while nothing scores (no model yet): say so, or the log reads as "running".
+    state = {k: "on" if v else "off" for k, v in new.items()}
+    if new["anomaly"] and not scorer:
+        state["anomaly"] = "on (no model loaded)"
+    print("switches: " + ", ".join(f"{k}={v}" for k, v in state.items()))
 
 apply_settings()
 

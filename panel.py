@@ -35,6 +35,9 @@ PLAIN_VERDICT = {"malicious": "Threat", "suspicious": "Worth a look", "benign": 
 PLAIN_DETECTION = {"signature": "Rule match", "anomaly": "Unusual behaviour",
                    "honeypot": "Someone tried the trap door", "recon": "Security check result"}
 NORMAL_VERDICTS = ("benign", "normal")   # hidden in Simple mode
+# Also hidden in Simple mode, as one "not yet explained" line: 'unknown' covers every row without
+# an AI verdict (AI unavailable, AI explanations off, unparsed answers).
+UNEXPLAINED = "unknown"
 SWITCH_LABELS = {"signatures": "Watch for known attacks", "anomaly": "Spot unusual behaviour",
                  "auto_block": "Block intruders automatically", "ai": "Explain alerts in plain English"}
 OFF_NOTES = {"signatures": "Off: alerts for known attacks are ignored. The network is still watched for unusual behaviour.",
@@ -209,12 +212,13 @@ def status():
         cols = "id, seen_at, detection, verdict, priority, signature, sid, severity, src_ip, dest_ip, count, score, reason, action"
         normal = ",".join("?" * len(NORMAL_VERDICTS))
         rows = query(f"SELECT {cols} FROM alerts ORDER BY id DESC LIMIT ?", (FEED_ROWS,))
-        simple_rows = query(f"SELECT {cols} FROM alerts WHERE verdict NOT IN ({normal}) ORDER BY id DESC LIMIT ?",
-                            (*NORMAL_VERDICTS, FEED_ROWS))
+        simple_rows = query(f"SELECT {cols} FROM alerts WHERE verdict NOT IN ({normal}, ?) ORDER BY id DESC LIMIT ?",
+                            (*NORMAL_VERDICTS, UNEXPLAINED, FEED_ROWS))
         (hidden,), = query(f"SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict IN ({normal})",
                            (hour, *NORMAL_VERDICTS))
+        (unexplained,), = query("SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict = ?", (hour, UNEXPLAINED))
     except sqlite3.Error as err:
-        threats = worth = hidden = 0
+        threats = worth = hidden = unexplained = 0
         rows = simple_rows = []
         problems.append(("red", f"Can't read the alert database ({err})."))
     sw, settings_error = switches()
@@ -244,7 +248,7 @@ def status():
     return {"level": level, "headline": headline, "problems": [p for _, p in problems],
             "services": states, "kernel_drops": d, "switches": sw, "settings_error": settings_error,
             "feed": [feed_item(r) for r in rows], "simple_feed": [feed_item(r) for r in simple_rows],
-            "hidden_last_hour": hidden}
+            "hidden_last_hour": hidden, "unexplained_last_hour": unexplained}
 
 
 def local_time(iso):
