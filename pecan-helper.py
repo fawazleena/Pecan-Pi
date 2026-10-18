@@ -14,8 +14,11 @@ Every call is logged to the journal (journalctl -t pecan-helper) with its argume
     pecan-helper list-remove allow|deny IP-or-CIDR
     pecan-helper list-blocks            # JSON: the honeypot's current timed blocks
     pecan-helper unblock IP             # lift one timed block early
+    pecan-helper rules-category CATEGORY on|off      # Suricata rule group; slow (suricata-update)
+    pecan-helper custom-add PROTO FROM TO PORT NAME [TEXT]
+    pecan-helper custom-remove SID
 """
-import fcntl, ipaddress, json, os, subprocess, sys, syslog, tempfile
+import fcntl, ipaddress, json, os, re, shutil, subprocess, sys, syslog, tempfile
 
 ETC = "/etc/pecan"
 SETTINGS = ETC + "/settings.json"
@@ -57,7 +60,7 @@ def read_settings():
 
 def write_atomic(path, text):
     """Atomic replace: readers see the old file or the new one, never half of one."""
-    fd, tmp = tempfile.mkstemp(dir=ETC, prefix=".tmp.")
+    fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".tmp.")
     try:
         with os.fdopen(fd, "w") as f:
             f.write(text)
@@ -94,9 +97,9 @@ def set_switch(args):
 
 
 # --- IP lists ---------------------------------------------------------------------------------
-def run(*cmd):
+def run(*cmd, timeout=10):
     try:
-        return subprocess.run(cmd, capture_output=True, text=True, timeout=10)
+        return subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.SubprocessError) as err:
         return subprocess.CompletedProcess(cmd, 1, "", str(err))
 
@@ -274,8 +277,250 @@ def unblock(args):
     print(json.dumps({"ok": True}))
 
 
+# --- Suricata rules ---------------------------------------------------------------------------
+# Every change is: write the new input, rebuild/test it, and only then let Suricata load it; any
+# failure puts the previous files back, and the running Suricata keeps its rules throughout.
+RULES_DIR = "/var/lib/suricata/rules"
+MERGED = RULES_DIR + "/suricata.rules"          # written by suricata-update
+CUSTOM = RULES_DIR + "/pecan-custom.rules"      # ours; listed under rule-files in suricata.yaml
+DISABLE_CONF = "/etc/suricata/disable.conf"
+YAML = "/etc/suricata/suricata.yaml"
+SOCKET = "/var/run/suricata/suricata-command.socket"
+SURICATA, SURICATA_UPDATE, SURICATASC = "/usr/bin/suricata", "/usr/bin/suricata-update", "/usr/bin/suricatasc"
+GENTLE = ("/usr/bin/nice", "-n", "19", "/usr/bin/ionice", "-c3")   # never starve the running Suricata
+# Groups the owner may switch off: noisy or policy rules, chosen by the second word of the rule
+# name ("ET INFO ..."). Malware, exploits, attacks and scans are deliberately not on this list.
+# Same names as panel.RULE_CATEGORIES (labels live there).
+CATEGORIES = {"info": ("INFO",), "hunting": ("HUNTING",), "games": ("GAMES",), "chat": ("CHAT",),
+              "p2p": ("P2P",), "tor": ("TOR",), "adware": ("ADWARE_PUP",)}
+DISABLE_HEAD = "# /etc/suricata/disable.conf: written by pecan-helper (change it in the panel)\n"
+SID_MIN, SID_MAX = 9100000, 9199999             # local.rules uses 9000001; ET Open uses 2000000-2999999
+MAX_CUSTOM = 100
+NAME_RE = re.compile(r"[A-Za-z0-9 .,:_()/-]{3,60}")
+TEXT_CHARS = 64
+
+
+def rules_locked():
+    """One rule change at a time; a second click is refused instead of queued for minutes."""
+    os.makedirs(ETC, mode=0o755, exist_ok=True)
+    lock = open(ETC + "/.rules-lock", "w")
+    try:
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        fail("another rule change is still running; try again in a minute", 1)
+    return lock
+
+
+def read_text(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except FileNotFoundError:
+        return None
+
+
+def disabled_categories():
+    text = read_text(DISABLE_CONF)
+    if text is None:
+        return set()
+    if not text.startswith(DISABLE_HEAD):
+        fail(f"{DISABLE_CONF} was not written by pecan-helper; move it away first", 1)
+    return {l.split(":", 1)[1].strip() for l in text.splitlines() if l.startswith("# pecan-category:")}
+
+
+def disable_text(off):
+    out = DISABLE_HEAD
+    for name in sorted(off):
+        out += f"# pecan-category: {name}\n"
+        out += "".join(f're:msg:\\s*"(ET|GPL) {word}\\b\n' for word in CATEGORIES[name])
+    return out
+
+
+class Snapshot:
+    """Copies of files about to change, put back by restore() if anything fails."""
+    def __init__(self, *paths):
+        self.saved = []
+        for p in paths:
+            prev = p + ".pecan-prev"
+            if os.path.exists(p):
+                shutil.copy2(p, prev)
+            self.saved.append((p, prev if os.path.exists(p) else None))
+
+    def restore(self):
+        for p, prev in self.saved:
+            if prev:
+                os.replace(prev, p)
+            elif os.path.exists(p):
+                os.unlink(p)
+
+    def drop(self):
+        for _, prev in self.saved:
+            if prev:
+                os.unlink(prev)
+
+
+def first_error(r):
+    lines = (r.stderr + r.stdout).splitlines()
+    errs = [l for l in lines if l.startswith("E:") or "rror" in l] or lines[-1:] or ["no output"]
+    return errs[0].strip()[:300]
+
+
+def suricata_test(*extra):
+    """suricata -T: load the config and rules without touching the running instance."""
+    logs = tempfile.mkdtemp(prefix="pecan-test.")
+    try:
+        return run(*GENTLE, SURICATA, "-T", "-c", YAML, "-l", logs, *extra, timeout=300)
+    finally:
+        shutil.rmtree(logs, ignore_errors=True)
+
+
+def reload_suricata():
+    """(ok, message). reload-rules over the unix socket waits until the new rules are live; if the
+    reload fails, Suricata keeps running on the old ones."""
+    if not os.path.exists(SOCKET):
+        return True, "saved; Suricata isn't running, it will load this when it starts"
+    r = run(SURICATASC, "-c", "reload-rules", SOCKET, timeout=300)
+    try:
+        if r.returncode or json.loads(r.stdout).get("return") != "OK":
+            return False, f"Suricata refused the reload: {(r.stdout or r.stderr).strip()[:200]}"
+        stats = json.loads(run(SURICATASC, "-c", "ruleset-stats", SOCKET).stdout)["message"][0]
+    except (ValueError, KeyError, IndexError, TypeError):
+        return True, "rules reloaded"
+    failed = stats.get("rules_failed", 0)
+    return True, f"rules reloaded: {stats.get('rules_loaded')} loaded" + (f", {failed} failed" if failed else "")
+
+
+def rules_category(args):
+    if len(args) != 2 or args[0] not in CATEGORIES or args[1] not in ("on", "off"):
+        fail("usage: rules-category " + "|".join(CATEGORIES) + " on|off")
+    name, on = args[0], args[1] == "on"
+    with rules_locked():
+        off = disabled_categories()
+        new = off - {name} if on else off | {name}
+        if new == off:
+            print(json.dumps({"ok": True, "applied": "already " + args[1]}))
+            return
+        snap = Snapshot(DISABLE_CONF, MERGED)
+        write_atomic(DISABLE_CONF, disable_text(new))
+        # --offline: rebuild from the rules downloaded last time, so a change never pulls in new rules.
+        r = run(*GENTLE, SURICATA_UPDATE, "--offline", "--no-reload", "--no-test",
+                "--disable-conf", DISABLE_CONF, timeout=600)
+        if r.returncode:
+            snap.restore()
+            fail(f"suricata-update failed, nothing changed: {first_error(r)}", 1)
+        r = suricata_test()
+        if r.returncode:
+            snap.restore()
+            fail(f"the new rule set failed Suricata's test, nothing changed: {first_error(r)}", 1)
+        ok, applied = reload_suricata()
+        if not ok:
+            snap.restore()
+            fail(applied + "; previous rules kept", 1)
+        snap.drop()
+    log(f"result=ok category {name}={args[1]} ({applied})")
+    print(json.dumps({"ok": True, "applied": applied}))
+
+
+def custom_rules():
+    """[(sid, line)] of the rules in pecan-custom.rules."""
+    out = []
+    for line in (read_text(CUSTOM) or "").splitlines():
+        m = re.search(r"\bsid:(\d+);", line)
+        if line.startswith("alert ") and m:
+            out.append((int(m.group(1)), line))
+    return out
+
+
+def endpoint(text):
+    """'any', 'home' or 'outside', or one IP/CIDR -> the rule's address field."""
+    words = {"any": "any", "home": "$HOME_NET", "outside": "$EXTERNAL_NET"}
+    return words.get(text) or fmt(parse_net(text))
+
+
+def content(text):
+    """Text to look for, as a content match: the characters that end or escape a rule field
+    (" ; \\ |) are written as hex bytes, so the text can't add rule keywords of its own."""
+    if not 1 <= len(text) <= TEXT_CHARS or any(not 32 <= ord(c) < 127 for c in text):
+        fail(f"text: 1-{TEXT_CHARS} plain characters")
+    body = "".join(f"|{ord(c):02X}|" if c in '";\\|' else c for c in text)
+    return f'content:"{body}"; nocase; '
+
+
+def loads_custom():
+    """Is pecan-custom.rules listed under rule-files in suricata.yaml (one-time setup)?"""
+    return re.search(r"^\s*-\s*(" + re.escape(RULES_DIR) + r"/)?pecan-custom\.rules\s*$",
+                     read_text(YAML) or "", re.M) is not None
+
+
+def write_custom(rules):
+    """Test the new file on its own (fast: only these rules), then put it in place and reload."""
+    text = "# " + CUSTOM + ": written by pecan-helper (change it in the panel)\n" + "".join(l + "\n" for _, l in rules)
+    fd, tmp = tempfile.mkstemp(dir=RULES_DIR, prefix=".tmp.", suffix=".rules")
+    with os.fdopen(fd, "w") as f:
+        f.write(text)
+    os.chmod(tmp, 0o644)
+    r = suricata_test("-S", tmp)
+    if r.returncode:
+        os.unlink(tmp)
+        fail(f"Suricata rejected the rule, nothing changed: {first_error(r)}", 1)
+    snap = Snapshot(CUSTOM)
+    os.replace(tmp, CUSTOM)
+    ok, applied = reload_suricata()
+    if not ok:
+        snap.restore()
+        fail(applied + "; previous rules kept", 1)
+    snap.drop()
+    return applied
+
+
+def custom_add(args):
+    if len(args) not in (5, 6):
+        fail("usage: custom-add tcp|udp|icmp|ip FROM TO PORT NAME [TEXT]  (FROM/TO: any|home|outside|IP-or-CIDR)")
+    proto, src, dst, port, name = args[0], endpoint(args[1]), endpoint(args[2]), args[3], args[4].strip()
+    if proto not in ("tcp", "udp", "icmp", "ip"):
+        fail("protocol: tcp, udp, icmp or ip")
+    if port != "any":
+        if proto not in ("tcp", "udp") or not port.isdigit() or not 1 <= int(port) <= 65535:
+            fail("port: 1-65535 (tcp/udp only) or any")
+        port = str(int(port))
+    if not NAME_RE.fullmatch(name):
+        fail("name: 3-60 letters, digits, spaces or . , : _ ( ) / -")
+    match = content(args[5]) if len(args) == 6 else ""
+    if not os.path.isdir(RULES_DIR):
+        fail(f"{RULES_DIR} is missing", 1)
+    if not loads_custom():
+        fail("Suricata isn't set up for custom rules yet: add '- pecan-custom.rules' under rule-files "
+             "in /etc/suricata/suricata.yaml", 1)
+    with rules_locked():
+        rules = custom_rules()
+        if len(rules) >= MAX_CUSTOM:
+            fail(f"at most {MAX_CUSTOM} custom rules")
+        used = {sid for sid, _ in rules}
+        sid = next(n for n in range(SID_MIN, SID_MAX + 1) if n not in used)
+        rule = (f'alert {proto} {src} any -> {dst} {port} (msg:"PECAN CUSTOM {name}"; {match}'
+                f"sid:{sid}; rev:1;)")
+        applied = write_custom(rules + [(sid, rule)])
+    log(f"result=ok custom += {rule} ({applied})")
+    print(json.dumps({"ok": True, "sid": sid, "applied": applied}))
+
+
+def custom_remove(args):
+    if len(args) != 1 or not args[0].isdigit() or not SID_MIN <= int(args[0]) <= SID_MAX:
+        fail(f"usage: custom-remove SID ({SID_MIN}-{SID_MAX})")
+    sid = int(args[0])
+    with rules_locked():
+        rules = custom_rules()
+        kept = [(n, l) for n, l in rules if n != sid]
+        if len(kept) == len(rules):
+            fail(f"no custom rule with SID {sid}")
+        applied = write_custom(kept)
+    log(f"result=ok custom -= {sid} ({applied})")
+    print(json.dumps({"ok": True, "applied": applied}))
+
+
 COMMANDS = {"set-switch": set_switch, "list-add": list_add, "list-remove": list_remove,
-            "list-blocks": list_blocks, "unblock": unblock}
+            "list-blocks": list_blocks, "unblock": unblock, "rules-category": rules_category,
+            "custom-add": custom_add, "custom-remove": custom_remove}
 
 
 def main():

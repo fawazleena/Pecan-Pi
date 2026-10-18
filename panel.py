@@ -7,7 +7,7 @@ the root-owned pecan-helper (one sudoers line, fixed subcommands, argv only, nev
     .venv/bin/python panel.py make-cert        # self-signed TLS cert -> panel/tls/ (gitignored)
     .venv/bin/python panel.py serve [--host IP] [--port 8443]   # default host: the Pi's tailscale0 IP
 """
-import argparse, getpass, json, os, secrets, sqlite3, subprocess, sys, threading, time
+import argparse, getpass, json, os, re, secrets, sqlite3, subprocess, sys, threading, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -48,6 +48,19 @@ OFF_NOTES = {"signatures": "Off: alerts for known attacks are ignored. The netwo
              "auto_block": "Off: visits to the trap door are recorded, but nobody is blocked. Existing blocks run out on their own.",
              "ai": "Off: alerts are stored without an explanation and nothing is sent to the AI service."}
 CACHE_PREFIXES = ("[cached] ", "[backfill] ", "[retriage] ")
+# Rule groups the owner may switch off (pecan-helper.CATEGORIES has the matching rule patterns).
+RULE_CATEGORIES = {
+    "info": ("Informational", "Normal but notable activity (updates, lookups). Most alerts come from here; "
+             "a few useful ones too, such as program downloads."),
+    "hunting": ("Broad searches", "Wide nets that catch a lot of harmless traffic."),
+    "adware": ("Adware and unwanted programs", ""),
+    "tor": ("Tor anonymity network", "Connections to or from Tor."),
+    "p2p": ("Peer-to-peer file sharing", "BitTorrent and similar."),
+    "chat": ("Chat apps", ""),
+    "games": ("Online games", "")}
+DISABLE_CONF = "/etc/suricata/disable.conf"             # written by pecan-helper rules-category
+CUSTOM_RULES = "/var/lib/suricata/rules/pecan-custom.rules"   # written by pecan-helper custom-add/remove
+RULE_TIMEOUT = 900   # suricata-update + suricata -T + reload take a minute or two on the Pi
 EDITABLE_LISTS = ("allow", "deny")   # protected.txt is installed by hand and shown locked
 
 load_dotenv(ENV)
@@ -143,21 +156,26 @@ def service_states():
     return {s: (out[i] if i < len(out) else "unknown") for i, s in enumerate(SERVICES)}
 
 
-def kernel_drops():
-    """capture.kernel_drops from the newest stats event near the end of eve.json, or None."""
+def latest_stats():
+    """The newest stats event near the end of eve.json, or {}."""
     try:
         with open(EVE, "rb") as f:
             f.seek(max(0, os.fstat(f.fileno()).st_size - STATS_TAIL))
             lines = f.read().decode(errors="replace").splitlines()
     except OSError:
-        return None
+        return {}
     for line in reversed(lines):
         if '"event_type":"stats"' in line:
             try:
-                return json.loads(line)["stats"]["capture"]["kernel_drops"]
+                return json.loads(line)["stats"]
             except (ValueError, KeyError):
                 continue
-    return None
+    return {}
+
+
+def kernel_drops():
+    """capture.kernel_drops from the newest stats event, or None."""
+    return latest_stats().get("capture", {}).get("kernel_drops")
 
 
 def query(sql, args=()):
@@ -276,10 +294,10 @@ def api_status():
 
 
 # --- switches -------------------------------------------------------------------------------
-def helper(*args):
+def helper(*args, timeout=30):
     """Run one fixed pecan-helper subcommand as root. (ok, message). -n: never prompt for a password."""
     try:
-        r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=30)
+        r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=timeout)
     except (OSError, subprocess.TimeoutExpired) as err:
         return False, str(err)
     return r.returncode == 0, (r.stdout if r.returncode == 0 else r.stderr or r.stdout).strip()
@@ -351,6 +369,79 @@ def api_unblock():
     if not ok:
         return jsonify(error=msg[:300] or "The Pi couldn't lift this block."), 400
     return jsonify(ok=True)
+
+
+# --- Suricata rules -------------------------------------------------------------------------
+def read_file(path):
+    try:
+        with open(path) as f:
+            return f.read()
+    except OSError:
+        return ""
+
+
+def rules_state():
+    """Category switches and custom rules from the helper-written files (world-readable), plus
+    what the running Suricata last loaded (eve.json stats)."""
+    off = {l.split(":", 1)[1].strip() for l in read_file(DISABLE_CONF).splitlines() if l.startswith("# pecan-category:")}
+    custom = []
+    for line in read_file(CUSTOM_RULES).splitlines():
+        sid, msg = re.search(r"\bsid:(\d+);", line), re.search(r'msg:"PECAN CUSTOM ([^"]*)"', line)
+        if line.startswith("alert ") and sid:
+            custom.append({"sid": int(sid.group(1)), "name": msg.group(1) if msg else "", "rule": line})
+    engine = (latest_stats().get("detect", {}).get("engines") or [{}])[0]
+    return {"categories": [{"name": k, "label": l, "note": n, "on": k not in off} for k, (l, n) in RULE_CATEGORIES.items()],
+            "custom": custom, "rules_loaded": engine.get("rules_loaded"), "rules_failed": engine.get("rules_failed"),
+            "last_reload": local_time(engine["last_reload"]) if engine.get("last_reload") else None}
+
+
+@app.get("/api/rules")
+def api_rules():
+    return jsonify(rules_state())
+
+
+@app.post("/api/rules/category")
+def api_rules_category():
+    body = request.get_json(silent=True) or {}
+    name, on = body.get("name"), body.get("on")
+    if name not in RULE_CATEGORIES or not isinstance(on, bool):   # only fixed names reach argv
+        abort(400)
+    ok, msg = helper("rules-category", name, "on" if on else "off", timeout=RULE_TIMEOUT)
+    print(f"rules category {name}={'on' if on else 'off'} from {request.remote_addr}: {'ok' if ok else msg}")
+    if not ok:
+        return jsonify(error=msg[:300] or "The Pi couldn't change the rules."), 400
+    try:
+        applied = json.loads(msg).get("applied", "")
+    except ValueError:
+        applied = ""
+    return jsonify(applied=applied, **rules_state())
+
+
+@app.post("/api/rules/custom")
+def api_rules_custom():
+    body = request.get_json(silent=True) or {}
+    if body.get("action") == "remove":
+        sid = body.get("sid")
+        if not isinstance(sid, int) or isinstance(sid, bool):
+            abort(400)
+        args = ["custom-remove", str(sid)]
+    elif body.get("action") == "add":
+        fields = [body.get(k) for k in ("proto", "src", "dst", "port", "name", "text")]
+        # Short strings only; pecan-helper validates every field again and builds the rule itself.
+        if any(not isinstance(f, str) or len(f) > 64 for f in fields) or not all(f.strip() for f in fields[:5]):
+            abort(400)
+        args = ["custom-add", *(f.strip() for f in fields[:5])] + ([fields[5]] if fields[5].strip() else [])
+    else:
+        abort(400)
+    ok, msg = helper(*args, timeout=RULE_TIMEOUT)
+    print(f"rules {' '.join(args)!r} from {request.remote_addr}: {'ok' if ok else msg}")
+    if not ok:
+        return jsonify(error=msg[:300] or "The Pi couldn't change the rules."), 400
+    try:
+        applied = json.loads(msg).get("applied", "")
+    except ValueError:
+        applied = ""
+    return jsonify(applied=applied, **rules_state())
 
 
 # --- setup commands ---------------------------------------------------------------------------

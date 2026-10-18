@@ -90,5 +90,9 @@ h3 { font-size: .95rem; margin: 0 0 8px; }
 .iplist .addr { font-family: ui-monospace, monospace; font-size: .85rem; }
 .iplist button { padding: 4px 10px; font-size: .8rem; background: var(--blue-soft); color: var(--blue); }
 .add { display: grid; gap: 6px; }
+.add .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.add select { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
+.iplist .rule { font-family: ui-monospace, monospace; font-size: .75rem; color: var(--muted); }
 .add input { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
 #lists-msg.error { color: var(--red); } #lists-msg.ok { color: var(--green); }
+#rules-msg.error { color: var(--red); } #rules-msg.ok { color: var(--green); }

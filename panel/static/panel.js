@@ -209,6 +209,81 @@ document.querySelectorAll("form.add").forEach(f => f.addEventListener("submit", 
 document.getElementById("lists-refresh").addEventListener("click", () => { listMsg("", true); loadLists(); });
 loadLists();
 
+// --- Rules: categories and custom rules. A change runs suricata-update/suricata -T and reloads
+// Suricata, so it takes a minute or two; everything stays disabled until the Pi answers.
+let rulesBusy = false;
+function rulesMsg(text, ok) {
+  const m = document.getElementById("rules-msg");
+  m.textContent = text;
+  m.className = "small " + (ok ? "ok" : "error");
+}
+
+function renderRules(d) {
+  document.getElementById("categories").replaceChildren(...d.categories.map(c => {
+    const row = el("button", "switch-row");
+    row.type = "button";
+    row.setAttribute("role", "switch");
+    row.setAttribute("aria-checked", c.on ? "true" : "false");
+    row.disabled = rulesBusy;
+    const label = el("span", "", c.label);
+    if (c.note) label.append(el("br"), el("span", "muted small", c.note));
+    row.append(label, el("span", "switch" + (c.on ? " on" : "")));
+    row.addEventListener("click", () => {
+      if (c.on && !confirm(`Stop watching for "${c.label}"? This takes a minute or two.`)) return;
+      rulesChange("/api/rules/category", { name: c.name, on: !c.on });
+    });
+    return row;
+  }));
+  const custom = d.custom.map(r => {
+    const li = entryRow(r.name || `SID ${r.sid}`, "", actionButton("Remove", () =>
+      confirm(`Remove the rule "${r.name}"?`) && rulesChange("/api/rules/custom", { action: "remove", sid: r.sid })));
+    li.firstChild.append(el("div", "rule it-only", r.rule));
+    return li;
+  });
+  if (!custom.length) custom.push(el("li", "muted small", "None yet."));
+  document.getElementById("custom").replaceChildren(...custom);
+  document.querySelectorAll("#custom button, #custom-add button").forEach(b => { b.disabled = rulesBusy; });
+  document.getElementById("rules-info").textContent = d.rules_loaded === null || d.rules_loaded === undefined ? ""
+    : `Suricata: ${d.rules_loaded} rules loaded, ${d.rules_failed} failed, last reload ${d.last_reload}. ` +
+      "Files: /etc/suricata/disable.conf, /var/lib/suricata/rules/pecan-custom.rules (SIDs 9100000-9199999).";
+}
+
+async function rulesChange(url, body) {
+  rulesBusy = true;
+  rulesMsg("Applying... this takes a minute or two. Monitoring keeps running.", true);
+  document.querySelectorAll("#rules button").forEach(b => { b.disabled = true; });
+  try {
+    const d = await post(url, body);
+    rulesMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
+    return true;
+  } catch (e) {
+    rulesMsg(e.message === "Failed to fetch" ? "Lost contact with the Pi. Press Refresh to see what was saved." : e.message, false);
+    return false;
+  } finally {
+    rulesBusy = false;
+    loadRules();
+  }
+}
+
+async function loadRules() {
+  try {
+    const r = await fetch("/api/rules", { credentials: "same-origin" });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (r.ok) renderRules(await r.json());
+  } catch (e) {
+    rulesMsg("Can't reach the Pi.", false);
+  }
+}
+
+document.getElementById("custom-add").addEventListener("submit", async e => {
+  e.preventDefault();
+  const f = e.target, v = k => f.elements[k].value.trim();
+  const body = { action: "add", name: v("name"), proto: v("proto"), port: v("port") || "any",
+                 src: v("src") || "any", dst: v("dst") || "any", text: f.elements.text.value };
+  if (await rulesChange("/api/rules/custom", body)) f.reset();
+});
+loadRules();
+
 document.getElementById("switches").addEventListener("click", e => {
   const row = e.target.closest(".switch-row");
   if (row && !row.disabled && !busy) toggle(row);

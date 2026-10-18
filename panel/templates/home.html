@@ -78,6 +78,40 @@
       <p class="muted small it-only">Trusted: max /16 (IPv6 /48). Always blocked: max /24 (IPv6 /64), only on wlan0/eth0;
         Tailscale is never filtered. Files: /etc/pecan/allowlist.txt, denylist.txt, protected.txt (pecan-helper).</p>
     </section>
+    <section class="glass" id="rules">
+      <h2>What to watch for</h2>
+      <p id="rules-msg" class="small" role="alert"></p>
+      <div class="lists">
+        <div>
+          <h3>Alert groups</h3>
+          <p class="muted small">Attacks, malware, exploits and scans: always watched.</p>
+          <div id="categories"></div>
+        </div>
+        <div>
+          <h3>Your own rules <span class="muted small">alert when traffic matches</span></h3>
+          <ul id="custom" class="iplist"></ul>
+          <form id="custom-add" class="add">
+            <input name="name" placeholder="Name, e.g. Telnet going out" maxlength="60" required aria-label="Rule name">
+            <div class="row">
+              <select name="proto" aria-label="Protocol">
+                <option value="tcp">TCP</option><option value="udp">UDP</option>
+                <option value="icmp">ICMP (ping)</option><option value="ip">Any protocol</option>
+              </select>
+              <input name="port" placeholder="Port or any" value="any" maxlength="5" required aria-label="Destination port">
+            </div>
+            <div class="row">
+              <input name="src" placeholder="From" value="any" maxlength="64" required aria-label="From">
+              <input name="dst" placeholder="To" value="any" maxlength="64" required aria-label="To">
+            </div>
+            <input name="text" placeholder="Containing text (optional)" maxlength="64" aria-label="Containing text">
+            <button type="submit">Add rule</button>
+          </form>
+          <p class="muted small">From / To: <b>any</b>, <b>home</b> (this network), <b>outside</b>, or an IP address or range.</p>
+        </div>
+      </div>
+      <p class="muted small">Changes take a minute or two. Monitoring keeps running meanwhile.</p>
+      <p id="rules-info" class="muted small it-only"></p>
+    </section>
   </main>
 </div>
 <script src="{{ url_for('static', filename='panel.js') }}"></script>
