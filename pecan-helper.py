@@ -284,6 +284,10 @@ RULES_DIR = "/var/lib/suricata/rules"
 MERGED = RULES_DIR + "/suricata.rules"          # written by suricata-update
 CUSTOM = RULES_DIR + "/pecan-custom.rules"      # ours; listed under rule-files in suricata.yaml
 DISABLE_CONF = "/etc/suricata/disable.conf"
+# SID 9000001 (ping test). suricata-update only merges its own fixed list of *-events.rules from
+# /etc/suricata/rules, so this file must be passed with --local on every rebuild or it is dropped.
+LOCAL_RULES = "/etc/suricata/rules/local.rules"
+OUR_SIDS = range(9000000, 9200000)              # local.rules + custom range: must never vanish in a rebuild
 YAML = "/etc/suricata/suricata.yaml"
 SOCKET = "/var/run/suricata/suricata-command.socket"
 SURICATA, SURICATA_UPDATE, SURICATASC = "/usr/bin/suricata", "/usr/bin/suricata-update", "/usr/bin/suricatasc"
@@ -334,6 +338,26 @@ def disable_text(off):
         out += f"# pecan-category: {name}\n"
         out += "".join(f're:msg:\\s*"(ET|GPL) {word}\\b\n' for word in CATEGORIES[name])
     return out
+
+
+def enabled_rules(path):
+    """{sid: rule line} of the enabled (not commented-out) rules in a rule file."""
+    out = {}
+    try:
+        with open(path, errors="replace") as f:
+            for line in f:
+                if line.startswith(("alert ", "drop ", "pass ", "reject ")):
+                    m = re.search(r"\bsid:\s*(\d+)\s*;", line)
+                    if m:
+                        out[int(m.group(1))] = line
+    except FileNotFoundError:
+        pass
+    return out
+
+
+def matches(line, off):
+    """Is this rule matched by a switched-off category's disable.conf pattern?"""
+    return any(re.search(rf'msg:\s*"(ET|GPL) {word}\b', line, re.I) for name in off for word in CATEGORIES[name])
 
 
 class Snapshot:
@@ -400,14 +424,22 @@ def rules_category(args):
         if new == off:
             print(json.dumps({"ok": True, "applied": "already " + args[1]}))
             return
+        before = enabled_rules(MERGED)
         snap = Snapshot(DISABLE_CONF, MERGED)
         write_atomic(DISABLE_CONF, disable_text(new))
         # --offline: rebuild from the rules downloaded last time, so a change never pulls in new rules.
         r = run(*GENTLE, SURICATA_UPDATE, "--offline", "--no-reload", "--no-test",
-                "--disable-conf", DISABLE_CONF, timeout=600)
+                "--disable-conf", DISABLE_CONF, "--local", LOCAL_RULES, timeout=600)
         if r.returncode:
             snap.restore()
             fail(f"suricata-update failed, nothing changed: {first_error(r)}", 1)
+        after = enabled_rules(MERGED)
+        lost = sorted(sid for sid in before if sid in OUR_SIDS and sid not in after)
+        if lost:
+            snap.restore()
+            fail(f"the rebuild dropped our own rule(s) {lost}, nothing changed", 1)
+        # Other rules may only disappear because a switched-off category matched them.
+        stray = sorted(sid for sid, line in before.items() if sid not in after and not matches(line, new))
         r = suricata_test()
         if r.returncode:
             snap.restore()
@@ -417,6 +449,8 @@ def rules_category(args):
             snap.restore()
             fail(applied + "; previous rules kept", 1)
         snap.drop()
+    if stray:
+        applied += f"; note: {len(stray)} other rule(s) not in the rebuild, e.g. SID {', '.join(map(str, stray[:5]))}"
     log(f"result=ok category {name}={args[1]} ({applied})")
     print(json.dumps({"ok": True, "applied": applied}))
 
