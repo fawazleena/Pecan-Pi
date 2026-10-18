@@ -16,6 +16,8 @@ Every call is logged to the journal (journalctl -t pecan-helper) with its argume
     pecan-helper unblock IP             # lift one timed block early
     pecan-helper rules-category CATEGORY on|off      # Suricata rule group; slow (suricata-update)
     pecan-helper custom-add PROTO FROM TO PORT NAME [TEXT]
+    pecan-helper custom-edit SID PROTO FROM TO PORT NAME [TEXT]   # same SID, rev+1, keeps on/off
+    pecan-helper custom-toggle SID on|off                        # off = kept, commented out
     pecan-helper custom-remove SID
 """
 import fcntl, ipaddress, json, os, re, shutil, subprocess, sys, syslog, tempfile
@@ -455,14 +457,56 @@ def rules_category(args):
     print(json.dumps({"ok": True, "applied": applied}))
 
 
+OFF_PREFIX = "# "   # a switched-off custom rule stays in the file, commented out
+
+
 def custom_rules():
-    """[(sid, line)] of the rules in pecan-custom.rules."""
+    """[(sid, line)] of the rules in pecan-custom.rules; a switched-off one starts with OFF_PREFIX."""
     out = []
     for line in (read_text(CUSTOM) or "").splitlines():
         m = re.search(r"\bsid:(\d+);", line)
-        if line.startswith("alert ") and m:
+        if line.startswith(("alert ", OFF_PREFIX + "alert ")) and m:
             out.append((int(m.group(1)), line))
     return out
+
+
+def custom_sid(text):
+    if not text.isdigit() or not SID_MIN <= int(text) <= SID_MAX:
+        fail(f"SID must be {SID_MIN}-{SID_MAX}")
+    return int(text)
+
+
+def build_rule(args, sid, rev):
+    """PROTO FROM TO PORT NAME [TEXT] -> one alert rule; every field validated here."""
+    if len(args) not in (5, 6):
+        fail("usage: PROTO FROM TO PORT NAME [TEXT]  (FROM/TO: any|home|outside|IP-or-CIDR)")
+    proto, src, dst, port, name = args[0], endpoint(args[1]), endpoint(args[2]), args[3], args[4].strip()
+    if proto not in ("tcp", "udp", "icmp", "ip"):
+        fail("protocol: tcp, udp, icmp or ip")
+    if port != "any":
+        if proto not in ("tcp", "udp") or not port.isdigit() or not 1 <= int(port) <= 65535:
+            fail("port: 1-65535 (tcp/udp only) or any")
+        port = str(int(port))
+    if not NAME_RE.fullmatch(name):
+        fail("name: 3-60 letters, digits, spaces or . , : _ ( ) / -")
+    match = content(args[5]) if len(args) == 6 else ""
+    return (f'alert {proto} {src} any -> {dst} {port} (msg:"PECAN CUSTOM {name}"; {match}'
+            f"sid:{sid}; rev:{rev};)")
+
+
+def check_custom_setup():
+    if not os.path.isdir(RULES_DIR):
+        fail(f"{RULES_DIR} is missing", 1)
+    if not loads_custom():
+        fail("Suricata isn't set up for custom rules yet: add '- pecan-custom.rules' under rule-files "
+             "in /etc/suricata/suricata.yaml", 1)
+
+
+def find_custom(rules, sid):
+    for i, (n, line) in enumerate(rules):
+        if n == sid:
+            return i, line
+    fail(f"no custom rule with SID {sid}")
 
 
 def endpoint(text):
@@ -508,53 +552,73 @@ def write_custom(rules):
 
 
 def custom_add(args):
-    if len(args) not in (5, 6):
-        fail("usage: custom-add tcp|udp|icmp|ip FROM TO PORT NAME [TEXT]  (FROM/TO: any|home|outside|IP-or-CIDR)")
-    proto, src, dst, port, name = args[0], endpoint(args[1]), endpoint(args[2]), args[3], args[4].strip()
-    if proto not in ("tcp", "udp", "icmp", "ip"):
-        fail("protocol: tcp, udp, icmp or ip")
-    if port != "any":
-        if proto not in ("tcp", "udp") or not port.isdigit() or not 1 <= int(port) <= 65535:
-            fail("port: 1-65535 (tcp/udp only) or any")
-        port = str(int(port))
-    if not NAME_RE.fullmatch(name):
-        fail("name: 3-60 letters, digits, spaces or . , : _ ( ) / -")
-    match = content(args[5]) if len(args) == 6 else ""
-    if not os.path.isdir(RULES_DIR):
-        fail(f"{RULES_DIR} is missing", 1)
-    if not loads_custom():
-        fail("Suricata isn't set up for custom rules yet: add '- pecan-custom.rules' under rule-files "
-             "in /etc/suricata/suricata.yaml", 1)
+    rule = build_rule(args, SID_MIN, 1)   # validate before taking the lock; the real SID comes below
+    check_custom_setup()
     with rules_locked():
         rules = custom_rules()
         if len(rules) >= MAX_CUSTOM:
             fail(f"at most {MAX_CUSTOM} custom rules")
         used = {sid for sid, _ in rules}
         sid = next(n for n in range(SID_MIN, SID_MAX + 1) if n not in used)
-        rule = (f'alert {proto} {src} any -> {dst} {port} (msg:"PECAN CUSTOM {name}"; {match}'
-                f"sid:{sid}; rev:1;)")
+        rule = build_rule(args, sid, 1)
         applied = write_custom(rules + [(sid, rule)])
     log(f"result=ok custom += {rule} ({applied})")
     print(json.dumps({"ok": True, "sid": sid, "applied": applied}))
 
 
-def custom_remove(args):
-    if len(args) != 1 or not args[0].isdigit() or not SID_MIN <= int(args[0]) <= SID_MAX:
-        fail(f"usage: custom-remove SID ({SID_MIN}-{SID_MAX})")
-    sid = int(args[0])
+def custom_edit(args):
+    if len(args) < 1:
+        fail("usage: custom-edit SID PROTO FROM TO PORT NAME [TEXT]")
+    sid = custom_sid(args[0])
+    build_rule(args[1:], sid, 1)
+    check_custom_setup()
     with rules_locked():
         rules = custom_rules()
-        kept = [(n, l) for n, l in rules if n != sid]
-        if len(kept) == len(rules):
-            fail(f"no custom rule with SID {sid}")
-        applied = write_custom(kept)
+        i, old = find_custom(rules, sid)
+        rev = re.search(r"\brev:(\d+);", old)
+        rule = build_rule(args[1:], sid, int(rev.group(1)) + 1 if rev else 2)
+        if old.startswith(OFF_PREFIX):   # editing doesn't switch a rule back on
+            rule = OFF_PREFIX + rule
+        rules[i] = (sid, rule)
+        applied = write_custom(rules)
+    log(f"result=ok custom {sid} := {rule} ({applied})")
+    print(json.dumps({"ok": True, "applied": applied}))
+
+
+def custom_toggle(args):
+    if len(args) != 2 or args[1] not in ("on", "off"):
+        fail("usage: custom-toggle SID on|off")
+    sid, on = custom_sid(args[0]), args[1] == "on"
+    check_custom_setup()
+    with rules_locked():
+        rules = custom_rules()
+        i, line = find_custom(rules, sid)
+        bare = line[len(OFF_PREFIX):] if line.startswith(OFF_PREFIX) else line
+        if (line == bare) == on:
+            print(json.dumps({"ok": True, "applied": "already " + args[1]}))
+            return
+        rules[i] = (sid, bare if on else OFF_PREFIX + bare)
+        applied = write_custom(rules)
+    log(f"result=ok custom {sid} {args[1]} ({applied})")
+    print(json.dumps({"ok": True, "applied": applied}))
+
+
+def custom_remove(args):
+    if len(args) != 1:
+        fail("usage: custom-remove SID")
+    sid = custom_sid(args[0])
+    with rules_locked():
+        rules = custom_rules()
+        i, _ = find_custom(rules, sid)
+        applied = write_custom(rules[:i] + rules[i + 1:])
     log(f"result=ok custom -= {sid} ({applied})")
     print(json.dumps({"ok": True, "applied": applied}))
 
 
 COMMANDS = {"set-switch": set_switch, "list-add": list_add, "list-remove": list_remove,
             "list-blocks": list_blocks, "unblock": unblock, "rules-category": rules_category,
-            "custom-add": custom_add, "custom-remove": custom_remove}
+            "custom-add": custom_add, "custom-edit": custom_edit, "custom-toggle": custom_toggle,
+            "custom-remove": custom_remove}
 
 
 def main():

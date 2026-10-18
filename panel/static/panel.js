@@ -52,7 +52,7 @@ async function toggle(row) {
       body: JSON.stringify({ name: row.dataset.name, on }) });
     if (r.status === 401) { location.href = "/login"; return; }
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) msg.textContent = body.error || "Couldn't change the setting.";
+    if (!r.ok) msg.textContent = (mode === "it" && body.detail) || body.error || "Couldn't change the setting.";
   } catch (e) {
     msg.textContent = "Can't reach the Pi. Nothing was changed.";
   } finally {
@@ -146,8 +146,18 @@ async function post(url, body) {
     body: JSON.stringify(body) });
   if (r.status === 401) { location.href = "/login"; throw new Error("signed out"); }
   const data = await r.json().catch(() => ({}));
-  if (!r.ok) throw new Error(data.error || "The Pi refused the change.");
+  if (!r.ok) {
+    const err = new Error(data.error || "The Pi refused the change.");
+    err.detail = data.detail;
+    throw err;
+  }
   return data;
+}
+
+// Simple mode: the plain sentence; IT mode: pecan-helper's own text when there is one.
+function errText(e, offline) {
+  if (e.message === "Failed to fetch") return offline;
+  return mode === "it" && e.detail ? e.detail : e.message;
 }
 
 async function change(list, action, net, note) {
@@ -156,7 +166,7 @@ async function change(list, action, net, note) {
     listMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
     return true;
   } catch (e) {
-    listMsg(e.message === "Failed to fetch" ? "Can't reach the Pi. Nothing was changed." : e.message, false);
+    listMsg(errText(e, "Can't reach the Pi. Nothing was changed."), false);
     return false;
   } finally {
     loadLists();
@@ -177,13 +187,13 @@ function renderLists(d) {
   if (!deny.length) deny.push(el("li", "muted small", "Nothing blocked."));
   document.getElementById("list-deny").replaceChildren(...deny);
   let blocks;
-  if (d.blocks_error) blocks = [el("li", "muted small", d.blocks_error)];
+  if (d.blocks_error) blocks = [el("li", "muted small", mode === "it" && d.blocks_detail ? d.blocks_detail : d.blocks_error)];
   else if (d.enforced === false) blocks = [el("li", "muted small",
     "The trap door service is stopped: nothing is being blocked right now, including the list on the left.")];
   else blocks = d.blocks.map(b => entryRow(b.ip, minutes(b.expires), actionButton("Unblock", async () => {
     if (!confirm(`Lift the block on ${b.ip} now?`)) return;
     try { await post("/api/unblock", { ip: b.ip }); listMsg(`${b.ip} unblocked.`, true); }
-    catch (e) { listMsg(e.message, false); }
+    catch (e) { listMsg(errText(e, "Can't reach the Pi. Nothing was changed."), false); }
     loadLists();
   })));
   if (!blocks.length) blocks.push(el("li", "muted small", "Nobody right now."));
@@ -235,14 +245,27 @@ function renderRules(d) {
     return row;
   }));
   const custom = d.custom.map(r => {
-    const li = entryRow(r.name || `SID ${r.sid}`, "", actionButton("Remove", () =>
+    const li = el("li", "rule-row" + (r.on ? "" : " off"));
+    const sw = el("button", "switch-row");
+    sw.type = "button";
+    sw.setAttribute("role", "switch");
+    sw.setAttribute("aria-checked", r.on ? "true" : "false");
+    const label = el("span", "", r.name);
+    label.append(el("br"), el("span", "muted small", r.summary + (r.on ? "" : " (off)")));
+    sw.append(label, el("span", "switch" + (r.on ? " on" : "")));
+    sw.addEventListener("click", () => {
+      if (r.on && !confirm(`Switch off the rule "${r.name}"? It is kept and can be switched back on.`)) return;
+      rulesChange("/api/rules/custom", { action: "toggle", sid: r.sid, on: !r.on });
+    });
+    const actions = el("div", "rule-actions");
+    actions.append(actionButton("Edit", () => editRule(r)), actionButton("Remove", () =>
       confirm(`Remove the rule "${r.name}"?`) && rulesChange("/api/rules/custom", { action: "remove", sid: r.sid })));
-    li.firstChild.append(el("div", "rule it-only", r.rule));
+    li.append(sw, actions, el("div", "rule it-only", `SID ${r.sid} rev ${r.rev}: ${r.rule}`));
     return li;
   });
   if (!custom.length) custom.push(el("li", "muted small", "None yet."));
   document.getElementById("custom").replaceChildren(...custom);
-  document.querySelectorAll("#custom button, #custom-add button").forEach(b => { b.disabled = rulesBusy; });
+  document.querySelectorAll("#rules button").forEach(b => { b.disabled = rulesBusy; });
   document.getElementById("rules-info").textContent = d.rules_loaded === null || d.rules_loaded === undefined ? ""
     : `Suricata: ${d.rules_loaded} rules loaded, ${d.rules_failed} failed, last reload ${d.last_reload}. ` +
       "Files: /etc/suricata/disable.conf, /var/lib/suricata/rules/pecan-custom.rules (SIDs 9100000-9199999).";
@@ -257,7 +280,7 @@ async function rulesChange(url, body) {
     rulesMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
     return true;
   } catch (e) {
-    rulesMsg(e.message === "Failed to fetch" ? "Lost contact with the Pi. Press Refresh to see what was saved." : e.message, false);
+    rulesMsg(errText(e, "Lost contact with the Pi. Reload the page to see what was saved."), false);
     return false;
   } finally {
     rulesBusy = false;
@@ -275,12 +298,35 @@ async function loadRules() {
   }
 }
 
+// The form adds a rule, or edits one (same SID, rev+1) after Edit loaded it. Empty boxes = any.
+let editing = null;   // SID being edited, or null
+function editRule(r) {
+  const f = document.getElementById("custom-add").elements;
+  editing = r.sid;
+  f.name.value = r.name; f.proto.value = r.proto; f.text.value = r.text;
+  for (const k of ["port", "src", "dst"]) f[k].value = r[k] === "any" ? "" : r[k];
+  document.getElementById("custom-form-title").textContent = `Edit "${r.name}"`;
+  document.getElementById("custom-save").textContent = "Save changes";
+  document.getElementById("custom-cancel").hidden = false;
+  f.name.focus();
+}
+
+function stopEditing() {
+  editing = null;
+  document.getElementById("custom-add").reset();
+  document.getElementById("custom-form-title").textContent = "New rule";
+  document.getElementById("custom-save").textContent = "Add rule";
+  document.getElementById("custom-cancel").hidden = true;
+}
+
+document.getElementById("custom-cancel").addEventListener("click", stopEditing);
 document.getElementById("custom-add").addEventListener("submit", async e => {
   e.preventDefault();
-  const f = e.target, v = k => f.elements[k].value.trim();
-  const body = { action: "add", name: v("name"), proto: v("proto"), port: v("port") || "any",
-                 src: v("src") || "any", dst: v("dst") || "any", text: f.elements.text.value };
-  if (await rulesChange("/api/rules/custom", body)) f.reset();
+  const f = e.target.elements, v = k => f[k].value.trim();
+  const body = { action: editing === null ? "add" : "edit", name: v("name"), proto: v("proto"),
+                 port: v("port"), src: v("src"), dst: v("dst"), text: f.text.value };
+  if (editing !== null) body.sid = editing;
+  if (await rulesChange("/api/rules/custom", body)) stopEditing();
 });
 loadRules();
 

@@ -60,7 +60,35 @@ RULE_CATEGORIES = {
     "games": ("Online games", "")}
 DISABLE_CONF = "/etc/suricata/disable.conf"             # written by pecan-helper rules-category
 CUSTOM_RULES = "/var/lib/suricata/rules/pecan-custom.rules"   # written by pecan-helper custom-add/remove
-RULE_TIMEOUT = 900   # suricata-update + suricata -T + reload take a minute or two on the Pi
+RULE_TIMEOUT = 900
+# pecan-helper's messages are technical; Simple mode shows the first matching plain sentence
+# (IT mode shows the helper's own text). Order matters: more specific patterns first.
+PLAIN_ERRORS = [
+    ("another rule change is still running", "Another change is still being applied. Try again in a minute."),
+    ("which is protected", "That address includes the admin's computer, which must always be able to reach the Pi."),
+    ("which is on the trusted list", "That address is on the Trusted list. Remove it there first."),
+    ("the Pi itself or its gateway", "That would cut the Pi off from its own network."),
+    ("on the blocked list", "That address is on the Always blocked list. Unblock it there first."),
+    ("already on the list", "That address is already on the list."),
+    ("too wide", "That range of addresses is too big. Use one address or a smaller range."),
+    ("not an IP address", "That doesn't look like an address. Use something like 192.168.1.20."),
+    ("can't be listed", "That address can't be added."),
+    ("list is full", "The list is full. Remove an entry first."),
+    ("is not on the", "That entry is already gone. The list has been refreshed."),
+    ("is not blocked right now", "That address isn't blocked any more."),
+    ("note:", "The name is too long or has unusual characters. Use up to 40 letters and numbers."),
+    ("protocol:", "Choose a protocol."),
+    ("port:", "The port must be a number from 1 to 65535, and only works with TCP or UDP. Leave it empty for any."),
+    ("name:", "The name needs 3 to 60 letters or numbers."),
+    ("text:", "The text to look for can be at most 64 plain characters."),
+    ("at most 100 custom rules", "You have the most rules allowed (100). Remove one first."),
+    ("no custom rule with SID", "That rule doesn't exist any more. The list has been refreshed."),
+    ("isn't set up for custom rules", "Custom rules aren't set up on this Pi yet."),
+    ("nothing changed", "The Pi couldn't apply this change, so nothing was changed."),
+    ("previous rules kept", "The Pi couldn't apply this change, so nothing was changed."),
+    ("password is required", "The Pi isn't set up to make changes from the panel yet."),
+    ("must run as root", "The Pi isn't set up to make changes from the panel yet."),
+]   # suricata-update + suricata -T + reload take a minute or two on the Pi
 EDITABLE_LISTS = ("allow", "deny")   # protected.txt is installed by hand and shown locked
 
 load_dotenv(ENV)
@@ -303,6 +331,18 @@ def helper(*args, timeout=30):
     return r.returncode == 0, (r.stdout if r.returncode == 0 else r.stderr or r.stdout).strip()
 
 
+def plain_error(msg):
+    for needle, plain in PLAIN_ERRORS:
+        if needle in msg:
+            return plain
+    return "The Pi couldn't make this change. Switch to IT view for details."
+
+
+def helper_error(msg, status=400):
+    """Error response: a plain sentence for Simple mode, the helper's own text for IT mode."""
+    return jsonify(error=plain_error(msg), detail=msg[:300]), status
+
+
 @app.post("/api/switch")
 def api_switch():
     body = request.get_json(silent=True) or {}
@@ -314,7 +354,7 @@ def api_switch():
     ok, msg = helper("set-switch", name, "on" if on else "off")
     print(f"switch {name}={'on' if on else 'off'} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return jsonify(error=f"The Pi couldn't change this setting ({msg[:200]})."), 500
+        return helper_error(msg, 500)
     return jsonify(switches=switches()[0])
 
 
@@ -336,7 +376,8 @@ def api_lists():
         blocks = None
     return jsonify(allow=entries("allow"), deny=entries("deny"), protected=entries("protected"),
                    blocks=blocks["blocks"] if blocks else [], enforced=blocks["enforced"] if blocks else None,
-                   blocks_error=None if blocks else f"Couldn't ask the Pi for current blocks ({out[:200]}).")
+                   blocks_error=None if blocks else "Couldn't ask the Pi who is blocked right now.",
+                   blocks_detail=None if blocks else out[:200])
 
 
 @app.post("/api/lists")
@@ -351,7 +392,7 @@ def api_lists_change():
     ok, msg = helper(*args)
     print(f"list {action} {name} {net.strip()!r} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return jsonify(error=msg[:300] or "The Pi couldn't change the list."), 400
+        return helper_error(msg)
     try:
         applied = json.loads(msg).get("applied", "")
     except ValueError:
@@ -367,7 +408,7 @@ def api_unblock():
     ok, msg = helper("unblock", ip)
     print(f"unblock {ip!r} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return jsonify(error=msg[:300] or "The Pi couldn't lift this block."), 400
+        return helper_error(msg)
     return jsonify(ok=True)
 
 
@@ -380,15 +421,30 @@ def read_file(path):
         return ""
 
 
+ADDR_WORDS = {"any": "any", "$HOME_NET": "home", "$EXTERNAL_NET": "outside"}
+CUSTOM_RE = re.compile(r'^(# )?alert (\S+) (\S+) any -> (\S+) (\S+) \(msg:"PECAN CUSTOM ([^"]*)"; '
+                       r'(?:content:"([^"]*)"; nocase; )?sid:(\d+); rev:(\d+);\)$')
+
+
+def parse_custom(line):
+    """One pecan-helper custom rule -> its form fields and a plain summary, or None."""
+    m = CUSTOM_RE.match(line)
+    if not m:
+        return None
+    off, proto, src, dst, port, name, content, sid, rev = m.groups()
+    src, dst = ADDR_WORDS.get(src, src), ADDR_WORDS.get(dst, dst)
+    text = re.sub(r"\|([0-9A-Fa-f]{2})\|", lambda h: chr(int(h.group(1), 16)), content or "")
+    summary = (f"{'Any protocol' if proto == 'ip' else proto.upper()} from {src} to {dst}"
+               + (f" port {port}" if port != "any" else "") + (f' containing "{text}"' if content else ""))
+    return {"sid": int(sid), "rev": int(rev), "on": not off, "name": name, "proto": proto, "src": src,
+            "dst": dst, "port": port, "text": text, "summary": summary, "rule": line}
+
+
 def rules_state():
     """Category switches and custom rules from the helper-written files (world-readable), plus
     what the running Suricata last loaded (eve.json stats)."""
     off = {l.split(":", 1)[1].strip() for l in read_file(DISABLE_CONF).splitlines() if l.startswith("# pecan-category:")}
-    custom = []
-    for line in read_file(CUSTOM_RULES).splitlines():
-        sid, msg = re.search(r"\bsid:(\d+);", line), re.search(r'msg:"PECAN CUSTOM ([^"]*)"', line)
-        if line.startswith("alert ") and sid:
-            custom.append({"sid": int(sid.group(1)), "name": msg.group(1) if msg else "", "rule": line})
+    custom = [r for r in map(parse_custom, read_file(CUSTOM_RULES).splitlines()) if r]
     engine = (latest_stats().get("detect", {}).get("engines") or [{}])[0]
     return {"categories": [{"name": k, "label": l, "note": n, "on": k not in off} for k, (l, n) in RULE_CATEGORIES.items()],
             "custom": custom, "rules_loaded": engine.get("rules_loaded"), "rules_failed": engine.get("rules_failed"),
@@ -409,7 +465,7 @@ def api_rules_category():
     ok, msg = helper("rules-category", name, "on" if on else "off", timeout=RULE_TIMEOUT)
     print(f"rules category {name}={'on' if on else 'off'} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return jsonify(error=msg[:300] or "The Pi couldn't change the rules."), 400
+        return helper_error(msg)
     try:
         applied = json.loads(msg).get("applied", "")
     except ValueError:
@@ -420,23 +476,29 @@ def api_rules_category():
 @app.post("/api/rules/custom")
 def api_rules_custom():
     body = request.get_json(silent=True) or {}
-    if body.get("action") == "remove":
-        sid = body.get("sid")
-        if not isinstance(sid, int) or isinstance(sid, bool):
-            abort(400)
+    action, sid = body.get("action"), body.get("sid")
+    if action != "add" and (not isinstance(sid, int) or isinstance(sid, bool)):
+        abort(400)
+    if action == "remove":
         args = ["custom-remove", str(sid)]
-    elif body.get("action") == "add":
-        fields = [body.get(k) for k in ("proto", "src", "dst", "port", "name", "text")]
-        # Short strings only; pecan-helper validates every field again and builds the rule itself.
-        if any(not isinstance(f, str) or len(f) > 64 for f in fields) or not all(f.strip() for f in fields[:5]):
+    elif action == "toggle":
+        if not isinstance(body.get("on"), bool):
             abort(400)
-        args = ["custom-add", *(f.strip() for f in fields[:5])] + ([fields[5]] if fields[5].strip() else [])
+        args = ["custom-toggle", str(sid), "on" if body["on"] else "off"]
+    elif action in ("add", "edit"):
+        fields = [body.get(k, "") for k in ("proto", "src", "dst", "port", "name", "text")]
+        # Short strings only; pecan-helper validates every field again and builds the rule itself.
+        if any(not isinstance(f, str) or len(f) > 64 for f in fields) or not fields[4].strip():
+            abort(400)
+        proto, src, dst, port, name = (f.strip() for f in fields[:5])
+        rule = [proto, src or "any", dst or "any", port or "any", name] + ([fields[5]] if fields[5].strip() else [])
+        args = ["custom-add", *rule] if action == "add" else ["custom-edit", str(sid), *rule]
     else:
         abort(400)
     ok, msg = helper(*args, timeout=RULE_TIMEOUT)
     print(f"rules {' '.join(args)!r} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return jsonify(error=msg[:300] or "The Pi couldn't change the rules."), 400
+        return helper_error(msg)
     try:
         applied = json.loads(msg).get("applied", "")
     except ValueError:

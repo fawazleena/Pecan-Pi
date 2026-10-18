@@ -91,22 +91,29 @@
           <h3>Your own rules <span class="muted small">alert when traffic matches</span></h3>
           <ul id="custom" class="iplist"></ul>
           <form id="custom-add" class="add">
-            <input name="name" placeholder="Name, e.g. Telnet going out" maxlength="60" required aria-label="Rule name">
+            <h3 id="custom-form-title">New rule</h3>
+            <label>Name <input name="name" placeholder="e.g. Telnet going out" maxlength="60" required></label>
             <div class="row">
-              <select name="proto" aria-label="Protocol">
-                <option value="tcp">TCP</option><option value="udp">UDP</option>
-                <option value="icmp">ICMP (ping)</option><option value="ip">Any protocol</option>
-              </select>
-              <input name="port" placeholder="Port or any" value="any" maxlength="5" required aria-label="Destination port">
+              <label>Protocol
+                <select name="proto">
+                  <option value="tcp">TCP</option><option value="udp">UDP</option>
+                  <option value="icmp">ICMP (ping)</option><option value="ip">Any protocol</option>
+                </select>
+              </label>
+              <label>Port <input name="port" placeholder="any" maxlength="5" inputmode="numeric"></label>
             </div>
             <div class="row">
-              <input name="src" placeholder="From" value="any" maxlength="64" required aria-label="From">
-              <input name="dst" placeholder="To" value="any" maxlength="64" required aria-label="To">
+              <label>From <input name="src" placeholder="any" maxlength="64"></label>
+              <label>To <input name="dst" placeholder="any" maxlength="64"></label>
             </div>
-            <input name="text" placeholder="Containing text (optional)" maxlength="64" aria-label="Containing text">
-            <button type="submit">Add rule</button>
+            <label>Text <input name="text" placeholder="anything (optional)" maxlength="64"></label>
+            <div class="row">
+              <button type="submit" id="custom-save">Add rule</button>
+              <button type="button" id="custom-cancel" class="link" hidden>Cancel</button>
+            </div>
           </form>
-          <p class="muted small">From / To: <b>any</b>, <b>home</b> (this network), <b>outside</b>, or an IP address or range.</p>
+          <p class="muted small">Empty boxes mean any. From / To: <b>home</b> (this network), <b>outside</b>,
+            or one address such as 192.168.1.20. Text: alert only when the traffic contains it.</p>
         </div>
       </div>
       <p class="muted small">Changes take a minute or two. Monitoring keeps running meanwhile.</p>
