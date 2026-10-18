@@ -90,6 +90,12 @@ h3 { font-size: .95rem; margin: 0 0 8px; }
 .iplist .addr { font-family: ui-monospace, monospace; font-size: .85rem; }
 .iplist button { padding: 4px 10px; font-size: .8rem; background: var(--blue-soft); color: var(--blue); }
 .add { display: grid; gap: 6px; }
+.field-error { color: var(--red); font-size: .8rem; }
+.field-error:empty { display: none; }
+.job { margin: 4px 0 0; color: var(--muted); }
+.job:empty { display: none; }
+.job.ok { color: var(--green); } .job.error { color: var(--red); }
+.item-error { color: var(--red); font-size: .8rem; margin: 2px 0 0; }
 .add label { display: grid; gap: 2px; font-size: .8rem; color: var(--muted); }
 .add h3 { margin: 8px 0 0; }
 .iplist .rule-row { display: grid; gap: 4px; }

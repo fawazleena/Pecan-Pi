@@ -8,6 +8,9 @@ raven can write. Installed by copy, root:root 0755:
     sudo install -o root -g root -m 0755 pecan-helper.py /usr/local/sbin/pecan-helper
 
 Every call is logged to the journal (journalctl -t pecan-helper) with its arguments and result.
+Output: one JSON line on stdout (success) or a message on stderr (failure, exit 1/2). The slow rule
+commands first print progress lines ("step: rebuilding|testing|reloading") so the panel can show them.
+Validation messages start with the field they are about ("port: ...").
 
     pecan-helper set-switch signatures|anomaly|auto_block|ai on|off
     pecan-helper list-add allow|deny IP-or-CIDR [NOTE]
@@ -306,6 +309,11 @@ NAME_RE = re.compile(r"[A-Za-z0-9 .,:_()/-]{3,60}")
 TEXT_CHARS = 64
 
 
+def step(name):
+    """Progress line for the panel (stdout, before the final JSON line)."""
+    print(f"step: {name}", flush=True)
+
+
 def rules_locked():
     """One rule change at a time; a second click is refused instead of queued for minutes."""
     os.makedirs(ETC, mode=0o755, exist_ok=True)
@@ -430,6 +438,7 @@ def rules_category(args):
         snap = Snapshot(DISABLE_CONF, MERGED)
         write_atomic(DISABLE_CONF, disable_text(new))
         # --offline: rebuild from the rules downloaded last time, so a change never pulls in new rules.
+        step("rebuilding")
         r = run(*GENTLE, SURICATA_UPDATE, "--offline", "--no-reload", "--no-test",
                 "--disable-conf", DISABLE_CONF, "--local", LOCAL_RULES, timeout=600)
         if r.returncode:
@@ -442,19 +451,23 @@ def rules_category(args):
             fail(f"the rebuild dropped our own rule(s) {lost}, nothing changed", 1)
         # Other rules may only disappear because a switched-off category matched them.
         stray = sorted(sid for sid, line in before.items() if sid not in after and not matches(line, new))
+        step("testing")
         r = suricata_test()
         if r.returncode:
             snap.restore()
             fail(f"the new rule set failed Suricata's test, nothing changed: {first_error(r)}", 1)
+        step("reloading")
         ok, applied = reload_suricata()
         if not ok:
             snap.restore()
             fail(applied + "; previous rules kept", 1)
         snap.drop()
+    changed = abs(len(before) - len(after))
+    summary = f"{changed} rule{'s' * (changed != 1)} {'back on' if on else 'off'}"
     if stray:
         applied += f"; note: {len(stray)} other rule(s) not in the rebuild, e.g. SID {', '.join(map(str, stray[:5]))}"
-    log(f"result=ok category {name}={args[1]} ({applied})")
-    print(json.dumps({"ok": True, "applied": applied}))
+    log(f"result=ok category {name}={args[1]} {summary} ({applied})")
+    print(json.dumps({"ok": True, "applied": applied, "summary": summary}))
 
 
 OFF_PREFIX = "# "   # a switched-off custom rule stays in the file, commented out
@@ -480,7 +493,7 @@ def build_rule(args, sid, rev):
     """PROTO FROM TO PORT NAME [TEXT] -> one alert rule; every field validated here."""
     if len(args) not in (5, 6):
         fail("usage: PROTO FROM TO PORT NAME [TEXT]  (FROM/TO: any|home|outside|IP-or-CIDR)")
-    proto, src, dst, port, name = args[0], endpoint(args[1]), endpoint(args[2]), args[3], args[4].strip()
+    proto, src, dst, port, name = args[0], endpoint(args[1], "from"), endpoint(args[2], "to"), args[3], args[4].strip()
     if proto not in ("tcp", "udp", "icmp", "ip"):
         fail("protocol: tcp, udp, icmp or ip")
     if port != "any":
@@ -509,10 +522,15 @@ def find_custom(rules, sid):
     fail(f"no custom rule with SID {sid}")
 
 
-def endpoint(text):
+def endpoint(text, field):
     """'any', 'home' or 'outside', or one IP/CIDR -> the rule's address field."""
     words = {"any": "any", "home": "$HOME_NET", "outside": "$EXTERNAL_NET"}
-    return words.get(text) or fmt(parse_net(text))
+    if text in words:
+        return words[text]
+    try:
+        return fmt(ipaddress.ip_network(text, strict=False))
+    except ValueError:
+        fail(f"{field}: not an IP address or CIDR: {text!r}")
 
 
 def content(text):
@@ -537,12 +555,14 @@ def write_custom(rules):
     with os.fdopen(fd, "w") as f:
         f.write(text)
     os.chmod(tmp, 0o644)
+    step("testing")
     r = suricata_test("-S", tmp)
     if r.returncode:
         os.unlink(tmp)
         fail(f"Suricata rejected the rule, nothing changed: {first_error(r)}", 1)
     snap = Snapshot(CUSTOM)
     os.replace(tmp, CUSTOM)
+    step("reloading")
     ok, applied = reload_suricata()
     if not ok:
         snap.restore()

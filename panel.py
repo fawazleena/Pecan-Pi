@@ -60,7 +60,11 @@ RULE_CATEGORIES = {
     "games": ("Online games", "")}
 DISABLE_CONF = "/etc/suricata/disable.conf"             # written by pecan-helper rules-category
 CUSTOM_RULES = "/var/lib/suricata/rules/pecan-custom.rules"   # written by pecan-helper custom-add/remove
-RULE_TIMEOUT = 900
+RULE_TIMEOUT = 900   # suricata-update + suricata -T + reload take a minute or two on the Pi
+STEP_WORDS = {"rebuilding": "Rebuilding rules", "testing": "Testing", "reloading": "Reloading"}
+# Validation messages from pecan-helper start with the field they are about -> the form box.
+FIELD_PREFIXES = {"protocol:": "proto", "from:": "src", "to:": "dst", "port:": "port", "name:": "name", "text:": "text"}
+ONE_AT_A_TIME = "One change at a time. Please wait."
 # pecan-helper's messages are technical; Simple mode shows the first matching plain sentence
 # (IT mode shows the helper's own text). Order matters: more specific patterns first.
 PLAIN_ERRORS = [
@@ -88,7 +92,7 @@ PLAIN_ERRORS = [
     ("previous rules kept", "The Pi couldn't apply this change, so nothing was changed."),
     ("password is required", "The Pi isn't set up to make changes from the panel yet."),
     ("must run as root", "The Pi isn't set up to make changes from the panel yet."),
-]   # suricata-update + suricata -T + reload take a minute or two on the Pi
+]
 EDITABLE_LISTS = ("allow", "deny")   # protected.txt is installed by hand and shown locked
 
 load_dotenv(ENV)
@@ -322,10 +326,10 @@ def api_status():
 
 
 # --- switches -------------------------------------------------------------------------------
-def helper(*args, timeout=30):
+def helper(*args):
     """Run one fixed pecan-helper subcommand as root. (ok, message). -n: never prompt for a password."""
     try:
-        r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=timeout)
+        r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as err:
         return False, str(err)
     return r.returncode == 0, (r.stdout if r.returncode == 0 else r.stderr or r.stdout).strip()
@@ -338,9 +342,10 @@ def plain_error(msg):
     return "The Pi couldn't make this change. Switch to IT view for details."
 
 
-def helper_error(msg, status=400):
-    """Error response: a plain sentence for Simple mode, the helper's own text for IT mode."""
-    return jsonify(error=plain_error(msg), detail=msg[:300]), status
+def helper_error(msg, status=400, field=None):
+    """Error response: a plain sentence for Simple mode, the helper's own text for IT mode, and
+    the form box it is about (if any)."""
+    return jsonify(error=plain_error(msg), detail=msg[:300], field=field), status
 
 
 @app.post("/api/switch")
@@ -392,7 +397,9 @@ def api_lists_change():
     ok, msg = helper(*args)
     print(f"list {action} {name} {net.strip()!r} from {request.remote_addr}: {'ok' if ok else msg}")
     if not ok:
-        return helper_error(msg)
+        # Everything but a full list is about what was typed: the note box or the address box.
+        field = "note" if msg.startswith("note:") else None if "list is full" in msg else "net"
+        return helper_error(msg, field=field if action == "add" else None)
     try:
         applied = json.loads(msg).get("applied", "")
     except ValueError:
@@ -413,6 +420,86 @@ def api_unblock():
 
 
 # --- Suricata rules -------------------------------------------------------------------------
+# A rule change takes up to a couple of minutes, so it runs as a background job: the POST returns
+# a job id at once, the page polls /api/jobs/<id> for the current step, and only one job runs at
+# a time (pecan-helper's own lock enforces that too). Jobs live in memory only.
+jobs, jobs_lock = {}, threading.Lock()
+
+
+def running_job():
+    return next((j for j in jobs.values() if j["state"] == "running"), None)
+
+
+def job_view(job):
+    end = job.get("ended") or time.time()
+    return {k: v for k, v in job.items() if k not in ("started", "ended")} | {"elapsed": int(end - job["started"])}
+
+
+def start_job(target, args):
+    """Job id, or None while another job runs."""
+    with jobs_lock:
+        if running_job():
+            return None
+        for old in sorted(jobs, key=lambda k: jobs[k]["started"])[:-20]:   # keep the last 20
+            del jobs[old]
+        jid = secrets.token_hex(8)
+        jobs[jid] = {"id": jid, "target": target, "state": "running", "step": "Starting",
+                     "started": time.time(), "summary": "", "error": "", "detail": "", "field": None}
+    threading.Thread(target=run_job, args=(jid, args), daemon=True).start()
+    return jid
+
+
+def run_job(jid, args):
+    job = jobs[jid]
+    result, err = "", ""
+    try:
+        # Own session: Ctrl-C or a panel restart must not kill the helper halfway through a change
+        # (it finishes, or rolls back, on its own).
+        p = subprocess.Popen(["sudo", "-n", HELPER, *args], stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                             text=True, start_new_session=True)
+        killer = threading.Timer(RULE_TIMEOUT, p.kill)
+        killer.start()
+        for line in p.stdout:   # "step: NAME" lines, then one JSON line
+            if line.startswith("step: "):
+                job["step"] = STEP_WORDS.get(line[6:].strip(), line[6:].strip())
+            elif line.strip():
+                result = line
+        err = p.stderr.read().strip()
+        p.wait()
+        killer.cancel()
+        ok = p.returncode == 0
+    except OSError as e:
+        ok, err = False, str(e)
+    if ok:
+        try:
+            summary = json.loads(result).get("summary", "")
+        except ValueError:
+            summary = ""
+        job.update(state="done", step="Done", summary=summary)
+    else:
+        err = err or "the change timed out"
+        field = next((f for prefix, f in FIELD_PREFIXES.items() if err.startswith(prefix)), None)
+        job.update(state="failed", step="Failed", error=plain_error(err), detail=err[:300], field=field)
+    job["ended"] = time.time()
+    print(f"job {' '.join(args)!r}: {job['state']} {job['summary'] or job['detail']}")
+
+
+@app.get("/api/jobs/<jid>")
+def api_job(jid):
+    job = jobs.get(jid)
+    if not job:
+        abort(404)
+    return jsonify(job_view(job))
+
+
+def job_response(target, args):
+    jid = start_job(target, args)
+    print(f"rules {' '.join(args)!r} from {request.remote_addr}: {'started ' + jid if jid else 'busy'}")
+    if not jid:
+        return jsonify(error=ONE_AT_A_TIME), 409
+    return jsonify(job=job_view(jobs[jid])), 202
+
+
 def read_file(path):
     try:
         with open(path) as f:
@@ -446,7 +533,8 @@ def rules_state():
     off = {l.split(":", 1)[1].strip() for l in read_file(DISABLE_CONF).splitlines() if l.startswith("# pecan-category:")}
     custom = [r for r in map(parse_custom, read_file(CUSTOM_RULES).splitlines()) if r]
     engine = (latest_stats().get("detect", {}).get("engines") or [{}])[0]
-    return {"categories": [{"name": k, "label": l, "note": n, "on": k not in off} for k, (l, n) in RULE_CATEGORIES.items()],
+    job = running_job()
+    return {"job": job_view(job) if job else None, "categories": [{"name": k, "label": l, "note": n, "on": k not in off} for k, (l, n) in RULE_CATEGORIES.items()],
             "custom": custom, "rules_loaded": engine.get("rules_loaded"), "rules_failed": engine.get("rules_failed"),
             "last_reload": local_time(engine["last_reload"]) if engine.get("last_reload") else None}
 
@@ -462,15 +550,7 @@ def api_rules_category():
     name, on = body.get("name"), body.get("on")
     if name not in RULE_CATEGORIES or not isinstance(on, bool):   # only fixed names reach argv
         abort(400)
-    ok, msg = helper("rules-category", name, "on" if on else "off", timeout=RULE_TIMEOUT)
-    print(f"rules category {name}={'on' if on else 'off'} from {request.remote_addr}: {'ok' if ok else msg}")
-    if not ok:
-        return helper_error(msg)
-    try:
-        applied = json.loads(msg).get("applied", "")
-    except ValueError:
-        applied = ""
-    return jsonify(applied=applied, **rules_state())
+    return job_response(f"cat:{name}", ["rules-category", name, "on" if on else "off"])
 
 
 @app.post("/api/rules/custom")
@@ -495,15 +575,8 @@ def api_rules_custom():
         args = ["custom-add", *rule] if action == "add" else ["custom-edit", str(sid), *rule]
     else:
         abort(400)
-    ok, msg = helper(*args, timeout=RULE_TIMEOUT)
-    print(f"rules {' '.join(args)!r} from {request.remote_addr}: {'ok' if ok else msg}")
-    if not ok:
-        return helper_error(msg)
-    try:
-        applied = json.loads(msg).get("applied", "")
-    except ValueError:
-        applied = ""
-    return jsonify(applied=applied, **rules_state())
+    # Progress shows where the click was: the form for add/edit, the rule's row otherwise.
+    return job_response("form" if action in ("add", "edit") else f"rule:{sid}", args)
 
 
 # --- setup commands ---------------------------------------------------------------------------

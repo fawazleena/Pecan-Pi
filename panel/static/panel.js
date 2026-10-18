@@ -30,18 +30,19 @@ function renderSwitches(list) {
     row.disabled = !w.available;
     const label = el("span", "", w.label);
     if (w.note) { label.append(el("br"), el("span", "muted small", w.note)); }
+    if (switchErr[w.name]) label.append(el("br"), el("span", "item-error", switchErr[w.name]));
     row.append(label, el("span", "switch" + (w.on ? " on" : "")));
     return row;
   }));
 }
 
 let busy = false;
+const switchErr = {};   // switch name -> why its last change failed (shown on the row)
 async function toggle(row) {
-  const on = row.getAttribute("aria-checked") !== "true";
-  const label = row.firstChild.textContent;
+  const on = row.getAttribute("aria-checked") !== "true", name = row.dataset.name;
+  const label = row.firstChild.firstChild.textContent;
   if (!on && !confirm(`Turn off "${label}"?`)) return;
-  const msg = document.getElementById("switch-msg");
-  msg.textContent = "";
+  delete switchErr[name];
   busy = true;
   row.disabled = true;
   try {
@@ -49,20 +50,24 @@ async function toggle(row) {
       method: "POST", credentials: "same-origin",
       headers: { "Content-Type": "application/json",
                  "X-CSRFToken": document.querySelector('meta[name="csrf-token"]').content },
-      body: JSON.stringify({ name: row.dataset.name, on }) });
+      body: JSON.stringify({ name, on }) });
     if (r.status === 401) { location.href = "/login"; return; }
     const body = await r.json().catch(() => ({}));
-    if (!r.ok) msg.textContent = (mode === "it" && body.detail) || body.error || "Couldn't change the setting.";
+    if (!r.ok) switchErr[name] = nothingChanged((mode === "it" && body.detail) || body.error || "Couldn't change the setting.");
   } catch (e) {
-    msg.textContent = "Can't reach the Pi. Nothing was changed.";
+    switchErr[name] = "Can't reach the Pi. Nothing was changed.";
   } finally {
     busy = false;
     refresh();   // redraw from the real state on the Pi, whatever happened
   }
 }
 
+let lastBlockRow = null;   // newest feed row where the firewall blocked someone
 function render(s) {
   last = s;
+  const blockRow = Math.max(0, ...s.feed.filter(f => f.action && f.action.startsWith("blocked")).map(f => f.id));
+  if (lastBlockRow !== null && blockRow > lastBlockRow) loadLists();   // a new timed block: show it
+  lastBlockRow = blockRow;
   const banner = document.getElementById("banner");
   banner.className = "glass banner " + s.level;
   document.getElementById("headline").textContent = s.headline;
@@ -107,14 +112,7 @@ async function refresh() {
   }
 }
 
-// --- IP lists: loaded on page load and after each change (current blocks need a root helper
-// call, which is journaled, so they are not part of the 5 s poll).
-function listMsg(text, ok) {
-  const m = document.getElementById("lists-msg");
-  m.textContent = text;
-  m.className = "small " + (ok ? "ok" : "error");
-}
-
+// --- shared helpers
 function entryRow(addr, note, button) {
   const li = el("li");
   const label = el("span");
@@ -134,8 +132,7 @@ function actionButton(text, onClick) {
 
 function minutes(sec) {
   if (sec === null || sec === undefined) return "";
-  const m = Math.ceil(sec / 60);
-  return `${m} min left`;
+  return `${Math.max(1, Math.ceil(sec / 60))} min left`;
 }
 
 async function post(url, body) {
@@ -149,6 +146,7 @@ async function post(url, body) {
   if (!r.ok) {
     const err = new Error(data.error || "The Pi refused the change.");
     err.detail = data.detail;
+    err.field = data.field;
     throw err;
   }
   return data;
@@ -160,42 +158,65 @@ function errText(e, offline) {
   return mode === "it" && e.detail ? e.detail : e.message;
 }
 
-async function change(list, action, net, note) {
-  try {
-    const d = await post("/api/lists", { list, action, net, note });
-    listMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
-    return true;
-  } catch (e) {
-    listMsg(errText(e, "Can't reach the Pi. Nothing was changed."), false);
-    return false;
-  } finally {
-    loadLists();
-  }
+function nothingChanged(text) {
+  return /nothing (was )?changed/i.test(text) ? text : `${text} Nothing was changed.`;
+}
+
+// Validation errors go under the box they are about; one call clears the others in that form.
+function fieldErrors(form, field, text) {
+  form.querySelectorAll(".field-error").forEach(e => { e.textContent = e.dataset.for === field ? text : ""; });
+}
+
+// --- IP lists: loaded on page load, after each change, when the status poll shows a new block,
+// and when a timed block runs out (current blocks need a root helper call, which is journaled,
+// so they are not part of the 5 s poll).
+const OFFLINE = "Can't reach the Pi. Nothing was changed.";
+let lists = null, listsAt = 0;   // last /api/lists answer and when it arrived
+const rowErr = {};               // "list:address" -> why removing it failed
+function listMsg(text, ok) {
+  const m = document.getElementById("lists-msg");
+  m.textContent = text;
+  m.className = "small " + (ok ? "ok" : "error");
+}
+
+function withError(li, key) {
+  if (rowErr[key]) li.append(el("div", "item-error", rowErr[key]));
+  return li;
+}
+
+async function removeEntry(key, url, body, done) {
+  delete rowErr[key];
+  listMsg("", true);
+  try { await post(url, body); listMsg(done, true); }
+  catch (e) { rowErr[key] = nothingChanged(errText(e, OFFLINE)); }
+  loadLists();
 }
 
 function renderLists(d) {
+  const left = Math.floor((Date.now() - listsAt) / 1000);   // seconds since the blocks were read
   const locked = d.protected.map(p => {
     const li = entryRow(p.net, p.note, el("span", "muted small", "locked"));
     li.classList.add("locked");
     return li;
   });
   document.getElementById("list-protected").replaceChildren(...locked);
-  document.getElementById("list-allow").replaceChildren(...d.allow.map(e => entryRow(e.net, e.note,
-    actionButton("Remove", () => confirm(`Stop trusting ${e.net}?`) && change("allow", "remove", e.net)))));
-  const deny = d.deny.map(e => entryRow(e.net, e.note,
-    actionButton("Unblock", () => confirm(`Unblock ${e.net}?`) && change("deny", "remove", e.net))));
+  document.getElementById("list-allow").replaceChildren(...d.allow.map(e => withError(entryRow(e.net, e.note,
+    actionButton("Remove", () => confirm(`Stop trusting ${e.net}?`) &&
+      removeEntry(`allow:${e.net}`, "/api/lists", { list: "allow", action: "remove", net: e.net }, `${e.net} is no longer trusted.`))),
+    `allow:${e.net}`)));
+  const deny = d.deny.map(e => withError(entryRow(e.net, e.note,
+    actionButton("Unblock", () => confirm(`Unblock ${e.net}?`) &&
+      removeEntry(`deny:${e.net}`, "/api/lists", { list: "deny", action: "remove", net: e.net }, `${e.net} unblocked.`))),
+    `deny:${e.net}`));
   if (!deny.length) deny.push(el("li", "muted small", "Nothing blocked."));
   document.getElementById("list-deny").replaceChildren(...deny);
   let blocks;
   if (d.blocks_error) blocks = [el("li", "muted small", mode === "it" && d.blocks_detail ? d.blocks_detail : d.blocks_error)];
   else if (d.enforced === false) blocks = [el("li", "muted small",
     "The trap door service is stopped: nothing is being blocked right now, including the list on the left.")];
-  else blocks = d.blocks.map(b => entryRow(b.ip, minutes(b.expires), actionButton("Unblock", async () => {
-    if (!confirm(`Lift the block on ${b.ip} now?`)) return;
-    try { await post("/api/unblock", { ip: b.ip }); listMsg(`${b.ip} unblocked.`, true); }
-    catch (e) { listMsg(errText(e, "Can't reach the Pi. Nothing was changed."), false); }
-    loadLists();
-  })));
+  else blocks = d.blocks.filter(b => b.expires === null || b.expires > left).map(b => withError(entryRow(b.ip,
+    minutes(b.expires === null ? null : b.expires - left), actionButton("Unblock", () => confirm(`Lift the block on ${b.ip} now?`) &&
+      removeEntry(`block:${b.ip}`, "/api/unblock", { ip: b.ip }, `${b.ip} unblocked.`))), `block:${b.ip}`));
   if (!blocks.length) blocks.push(el("li", "muted small", "Nobody right now."));
   document.getElementById("list-blocks").replaceChildren(...blocks);
 }
@@ -204,45 +225,77 @@ async function loadLists() {
   try {
     const r = await fetch("/api/lists", { credentials: "same-origin" });
     if (r.status === 401) { location.href = "/login"; return; }
-    if (r.ok) renderLists(await r.json());
+    if (r.ok) { lists = await r.json(); listsAt = Date.now(); renderLists(lists); }
   } catch (e) {
-    listMsg("Can't reach the Pi. Retrying when you press Refresh.", false);
+    listMsg("Can't reach the Pi. Trying again...", false);
+    setTimeout(loadLists, 10000);
   }
 }
 
-document.querySelectorAll("form.add").forEach(f => f.addEventListener("submit", async e => {
+// Count timed blocks down locally; ask the Pi again once one should have run out.
+setInterval(() => {
+  if (!lists || !lists.blocks) return;
+  const left = (Date.now() - listsAt) / 1000;
+  if (lists.blocks.some(b => b.expires !== null && b.expires <= left)) loadLists();
+  else renderLists(lists);
+}, 15000);
+
+document.querySelectorAll("form.add[data-list]").forEach(f => f.addEventListener("submit", async e => {
   e.preventDefault();
   const net = f.net.value.trim(), note = f.note.value.trim();
+  fieldErrors(f, null, "");
+  listMsg("", true);
   if (f.dataset.list === "deny" && !confirm(`Block ${net} from reaching the Pi until you unblock it?`)) return;
-  if (await change(f.dataset.list, "add", net, note)) f.reset();
+  try {
+    const d = await post("/api/lists", { list: f.dataset.list, action: "add", net, note });
+    listMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
+    f.reset();
+  } catch (err) {
+    const text = errText(err, OFFLINE);
+    if (err.field) fieldErrors(f, err.field, text); else listMsg(nothingChanged(text), false);
+  }
+  loadLists();
 }));
-document.getElementById("lists-refresh").addEventListener("click", () => { listMsg("", true); loadLists(); });
 loadLists();
 
-// --- Rules: categories and custom rules. A change runs suricata-update/suricata -T and reloads
-// Suricata, so it takes a minute or two; everything stays disabled until the Pi answers.
-let rulesBusy = false;
+// --- Rules: categories and custom rules. A change is a background job on the Pi (rebuild/test/
+// reload, up to a couple of minutes): the page polls it every second, shows the step and the
+// seconds on the item that was clicked, keeps every rule control disabled until it ends, then
+// reloads this section. One job at a time, on the Pi and here.
+let rules = null, job = null;   // last /api/rules answer; the job being followed
+const jobStatus = {};            // target ("cat:games", "rule:9100000", "form") -> {text, cls}
+const form = document.getElementById("custom-add");
+
 function rulesMsg(text, ok) {
   const m = document.getElementById("rules-msg");
   m.textContent = text;
   m.className = "small " + (ok ? "ok" : "error");
 }
 
-function renderRules(d) {
+function statusLine(target) {
+  const p = el("p", "job small " + (jobStatus[target] ? jobStatus[target].cls : ""), jobStatus[target] ? jobStatus[target].text : "");
+  p.setAttribute("aria-live", "polite");
+  return p;
+}
+
+function renderRules() {
+  const d = rules;
+  if (!d) return;
   document.getElementById("categories").replaceChildren(...d.categories.map(c => {
+    const box = el("div");
     const row = el("button", "switch-row");
     row.type = "button";
     row.setAttribute("role", "switch");
     row.setAttribute("aria-checked", c.on ? "true" : "false");
-    row.disabled = rulesBusy;
     const label = el("span", "", c.label);
     if (c.note) label.append(el("br"), el("span", "muted small", c.note));
     row.append(label, el("span", "switch" + (c.on ? " on" : "")));
     row.addEventListener("click", () => {
       if (c.on && !confirm(`Stop watching for "${c.label}"? This takes a minute or two.`)) return;
-      rulesChange("/api/rules/category", { name: c.name, on: !c.on });
+      startJob("/api/rules/category", { name: c.name, on: !c.on }, `cat:${c.name}`);
     });
-    return row;
+    box.append(row, statusLine(`cat:${c.name}`));
+    return box;
   }));
   const custom = d.custom.map(r => {
     const li = el("li", "rule-row" + (r.on ? "" : " off"));
@@ -255,36 +308,80 @@ function renderRules(d) {
     sw.append(label, el("span", "switch" + (r.on ? " on" : "")));
     sw.addEventListener("click", () => {
       if (r.on && !confirm(`Switch off the rule "${r.name}"? It is kept and can be switched back on.`)) return;
-      rulesChange("/api/rules/custom", { action: "toggle", sid: r.sid, on: !r.on });
+      startJob("/api/rules/custom", { action: "toggle", sid: r.sid, on: !r.on }, `rule:${r.sid}`);
     });
     const actions = el("div", "rule-actions");
     actions.append(actionButton("Edit", () => editRule(r)), actionButton("Remove", () =>
-      confirm(`Remove the rule "${r.name}"?`) && rulesChange("/api/rules/custom", { action: "remove", sid: r.sid })));
-    li.append(sw, actions, el("div", "rule it-only", `SID ${r.sid} rev ${r.rev}: ${r.rule}`));
+      confirm(`Remove the rule "${r.name}"?`) && startJob("/api/rules/custom", { action: "remove", sid: r.sid }, `rule:${r.sid}`)));
+    li.append(sw, actions, statusLine(`rule:${r.sid}`), el("div", "rule it-only", `SID ${r.sid} rev ${r.rev}: ${r.rule}`));
     return li;
   });
   if (!custom.length) custom.push(el("li", "muted small", "None yet."));
   document.getElementById("custom").replaceChildren(...custom);
-  document.querySelectorAll("#rules button").forEach(b => { b.disabled = rulesBusy; });
+  const formLine = form.querySelector(".job");
+  formLine.textContent = jobStatus.form ? jobStatus.form.text : "";
+  formLine.className = "job small " + (jobStatus.form ? jobStatus.form.cls : "");
+  // Every rule control is off while a job runs, whoever started it.
+  document.querySelectorAll("#rules button, #rules input, #rules select").forEach(b => { b.disabled = !!job; });
+  if (job) rulesMsg("One change at a time. Please wait.", true);
+  else if (document.getElementById("rules-msg").textContent.startsWith("One change")) rulesMsg("", true);
   document.getElementById("rules-info").textContent = d.rules_loaded === null || d.rules_loaded === undefined ? ""
     : `Suricata: ${d.rules_loaded} rules loaded, ${d.rules_failed} failed, last reload ${d.last_reload}. ` +
       "Files: /etc/suricata/disable.conf, /var/lib/suricata/rules/pecan-custom.rules (SIDs 9100000-9199999).";
 }
 
-async function rulesChange(url, body) {
-  rulesBusy = true;
-  rulesMsg("Applying... this takes a minute or two. Monitoring keeps running.", true);
-  document.querySelectorAll("#rules button").forEach(b => { b.disabled = true; });
+function showJob(j) {
+  if (j.state === "running") jobStatus[j.target] = { text: `${j.step}... ${j.elapsed}s`, cls: "" };
+  else if (j.state === "done") jobStatus[j.target] = { text: `Done${j.summary ? " (" + j.summary + ")" : ""} · ${j.elapsed}s`, cls: "ok" };
+  else if (j.field && j.target === "form") {
+    jobStatus.form = null;
+    fieldErrors(form, j.field, mode === "it" ? j.detail : j.error);
+  } else jobStatus[j.target] = { text: nothingChanged(mode === "it" ? j.detail : j.error), cls: "error" };
+}
+
+async function startJob(url, body, target) {
+  for (const k in status) delete jobStatus[k];   // only the newest change keeps a status line
+  fieldErrors(form, null, "");
+  rulesMsg("", true);
   try {
     const d = await post(url, body);
-    rulesMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
-    return true;
+    follow(d.job);
   } catch (e) {
-    rulesMsg(errText(e, "Lost contact with the Pi. Reload the page to see what was saved."), false);
-    return false;
-  } finally {
-    rulesBusy = false;
+    const text = errText(e, OFFLINE);
+    if (e.field && target === "form") fieldErrors(form, e.field, text);
+    else jobStatus[target] = { text: nothingChanged(text), cls: "error" };
     loadRules();
+  }
+}
+
+function follow(j) {
+  job = j;
+  showJob(j);
+  renderRules();
+  setTimeout(poll, 1000);
+}
+
+async function poll() {
+  if (!job) return;
+  try {
+    const r = await fetch(`/api/jobs/${job.id}`, { credentials: "same-origin" });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (r.status === 404) {   // the panel restarted: the job's outcome is unknown, show what is on the Pi
+      jobStatus[job.target] = { text: "Lost track of this change (the panel restarted). The list shows what the Pi has now.", cls: "error" };
+      job = null;
+      loadRules();
+      return;
+    }
+    const j = await r.json();
+    showJob(j);
+    if (j.state === "running") { job = j; renderRules(); setTimeout(poll, 1000); return; }
+    job = null;
+    if (j.state === "done" && j.target === "form") stopEditing();
+    loadRules();
+  } catch (e) {
+    jobStatus[job.target] = { text: `Lost contact with the Pi, still waiting... ${job.elapsed}s`, cls: "" };
+    renderRules();
+    setTimeout(poll, 3000);
   }
 }
 
@@ -292,19 +389,24 @@ async function loadRules() {
   try {
     const r = await fetch("/api/rules", { credentials: "same-origin" });
     if (r.status === 401) { location.href = "/login"; return; }
-    if (r.ok) renderRules(await r.json());
+    if (!r.ok) return;
+    rules = await r.json();
+    if (rules.job && !job) { follow(rules.job); return; }   // a change started elsewhere or before a reload
+    renderRules();
   } catch (e) {
-    rulesMsg("Can't reach the Pi.", false);
+    rulesMsg("Can't reach the Pi. Trying again...", false);
+    setTimeout(loadRules, 10000);
   }
 }
 
 // The form adds a rule, or edits one (same SID, rev+1) after Edit loaded it. Empty boxes = any.
 let editing = null;   // SID being edited, or null
 function editRule(r) {
-  const f = document.getElementById("custom-add").elements;
+  const f = form.elements;
   editing = r.sid;
   f.name.value = r.name; f.proto.value = r.proto; f.text.value = r.text;
   for (const k of ["port", "src", "dst"]) f[k].value = r[k] === "any" ? "" : r[k];
+  fieldErrors(form, null, "");
   document.getElementById("custom-form-title").textContent = `Edit "${r.name}"`;
   document.getElementById("custom-save").textContent = "Save changes";
   document.getElementById("custom-cancel").hidden = false;
@@ -313,20 +415,20 @@ function editRule(r) {
 
 function stopEditing() {
   editing = null;
-  document.getElementById("custom-add").reset();
+  form.reset();
   document.getElementById("custom-form-title").textContent = "New rule";
   document.getElementById("custom-save").textContent = "Add rule";
   document.getElementById("custom-cancel").hidden = true;
 }
 
-document.getElementById("custom-cancel").addEventListener("click", stopEditing);
-document.getElementById("custom-add").addEventListener("submit", async e => {
+document.getElementById("custom-cancel").addEventListener("click", () => { stopEditing(); fieldErrors(form, null, ""); });
+form.addEventListener("submit", e => {
   e.preventDefault();
-  const f = e.target.elements, v = k => f[k].value.trim();
+  const f = form.elements, v = k => f[k].value.trim();
   const body = { action: editing === null ? "add" : "edit", name: v("name"), proto: v("proto"),
                  port: v("port"), src: v("src"), dst: v("dst"), text: f.text.value };
   if (editing !== null) body.sid = editing;
-  if (await rulesChange("/api/rules/custom", body)) stopEditing();
+  startJob("/api/rules/custom", body, "form");
 });
 loadRules();
 

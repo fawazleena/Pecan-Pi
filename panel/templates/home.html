@@ -23,7 +23,6 @@
       </button>
       {% endfor %}
     </div>
-    <p id="switch-msg" class="error small" role="alert"></p>
     <p class="muted small">Changes take effect within 30 seconds and stay after a restart.</p>
     <p id="settings-error" class="error small it-only">{{ s.settings_error or '' }}</p>
     <h2>Services</h2>
@@ -56,7 +55,9 @@
           <ul id="list-allow" class="iplist"></ul>
           <form class="add" data-list="allow">
             <input name="net" placeholder="IP address or range" maxlength="64" required aria-label="Address to trust">
+            <span class="field-error" data-for="net" role="alert"></span>
             <input name="note" placeholder="Name (optional)" maxlength="40" aria-label="Name">
+            <span class="field-error" data-for="note" role="alert"></span>
             <button type="submit">Trust</button>
           </form>
         </div>
@@ -65,14 +66,15 @@
           <ul id="list-deny" class="iplist"></ul>
           <form class="add" data-list="deny">
             <input name="net" placeholder="IP address or range" maxlength="64" required aria-label="Address to block">
+            <span class="field-error" data-for="net" role="alert"></span>
             <input name="note" placeholder="Name (optional)" maxlength="40" aria-label="Name">
+            <span class="field-error" data-for="note" role="alert"></span>
             <button type="submit">Block</button>
           </form>
         </div>
         <div>
           <h3>Blocked for a while <span class="muted small">touched the trap door</span></h3>
           <ul id="list-blocks" class="iplist"></ul>
-          <button type="button" class="link" id="lists-refresh">Refresh</button>
         </div>
       </div>
       <p class="muted small it-only">Trusted: max /16 (IPv6 /48). Always blocked: max /24 (IPv6 /64), only on wlan0/eth0;
@@ -92,31 +94,38 @@
           <ul id="custom" class="iplist"></ul>
           <form id="custom-add" class="add">
             <h3 id="custom-form-title">New rule</h3>
-            <label>Name <input name="name" placeholder="e.g. Telnet going out" maxlength="60" required></label>
+            <label>Name <input name="name" placeholder="e.g. Telnet going out" maxlength="60" required>
+              <span class="field-error" data-for="name" role="alert"></span></label>
             <div class="row">
               <label>Protocol
                 <select name="proto">
                   <option value="tcp">TCP</option><option value="udp">UDP</option>
                   <option value="icmp">ICMP (ping)</option><option value="ip">Any protocol</option>
                 </select>
+                <span class="field-error" data-for="proto" role="alert"></span>
               </label>
-              <label>Port <input name="port" placeholder="any" maxlength="5" inputmode="numeric"></label>
+              <label>Port <input name="port" placeholder="any" maxlength="5" inputmode="numeric">
+                <span class="field-error" data-for="port" role="alert"></span></label>
             </div>
             <div class="row">
-              <label>From <input name="src" placeholder="any" maxlength="64"></label>
-              <label>To <input name="dst" placeholder="any" maxlength="64"></label>
+              <label>From <input name="src" placeholder="any" maxlength="64">
+                <span class="field-error" data-for="src" role="alert"></span></label>
+              <label>To <input name="dst" placeholder="any" maxlength="64">
+                <span class="field-error" data-for="dst" role="alert"></span></label>
             </div>
-            <label>Text <input name="text" placeholder="anything (optional)" maxlength="64"></label>
+            <label>Text <input name="text" placeholder="anything (optional)" maxlength="64">
+              <span class="field-error" data-for="text" role="alert"></span></label>
             <div class="row">
               <button type="submit" id="custom-save">Add rule</button>
               <button type="button" id="custom-cancel" class="link" hidden>Cancel</button>
             </div>
+            <p class="job small" data-target="form" aria-live="polite"></p>
           </form>
           <p class="muted small">Empty boxes mean any. From / To: <b>home</b> (this network), <b>outside</b>,
             or one address such as 192.168.1.20. Text: alert only when the traffic contains it.</p>
         </div>
       </div>
-      <p class="muted small">Changes take a minute or two. Monitoring keeps running meanwhile.</p>
+      <p class="muted small">Group changes take a minute or two, rules about half a minute. Monitoring keeps running meanwhile.</p>
       <p id="rules-info" class="muted small it-only"></p>
     </section>
   </main>
