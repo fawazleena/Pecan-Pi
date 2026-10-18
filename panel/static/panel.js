@@ -297,23 +297,28 @@ function renderRules() {
     box.append(row, statusLine(`cat:${c.name}`));
     return box;
   }));
+  // One card per rule, like the IP-list cards: name and plain summary on the left; Edit, Remove
+  // and the on/off switch on the right; progress and (IT mode) the rule text underneath.
   const custom = d.custom.map(r => {
-    const li = el("li", "rule-row" + (r.on ? "" : " off"));
-    const sw = el("button", "switch-row");
+    const li = el("li", "rule-card" + (r.on ? "" : " off"));
+    const text = el("div", "rule-text");
+    const name = el("div", "rule-name", r.name);
+    if (!r.on) name.append(" ", el("span", "off-label", "Off"));
+    text.append(name, el("div", "muted small", r.summary));
+    const sw = el("button", "toggle");
     sw.type = "button";
     sw.setAttribute("role", "switch");
     sw.setAttribute("aria-checked", r.on ? "true" : "false");
-    const label = el("span", "", r.name);
-    label.append(el("br"), el("span", "muted small", r.summary + (r.on ? "" : " (off)")));
-    sw.append(label, el("span", "switch" + (r.on ? " on" : "")));
+    sw.setAttribute("aria-label", `Rule "${r.name}"`);
+    sw.append(el("span", "switch" + (r.on ? " on" : "")));
     sw.addEventListener("click", () => {
       if (r.on && !confirm(`Switch off the rule "${r.name}"? It is kept and can be switched back on.`)) return;
       startJob("/api/rules/custom", { action: "toggle", sid: r.sid, on: !r.on }, `rule:${r.sid}`);
     });
     const actions = el("div", "rule-actions");
     actions.append(actionButton("Edit", () => editRule(r)), actionButton("Remove", () =>
-      confirm(`Remove the rule "${r.name}"?`) && startJob("/api/rules/custom", { action: "remove", sid: r.sid }, `rule:${r.sid}`)));
-    li.append(sw, actions, statusLine(`rule:${r.sid}`), el("div", "rule it-only", `SID ${r.sid} rev ${r.rev}: ${r.rule}`));
+      confirm(`Remove the rule "${r.name}"?`) && startJob("/api/rules/custom", { action: "remove", sid: r.sid }, `rule:${r.sid}`)), sw);
+    li.append(text, actions, statusLine(`rule:${r.sid}`), el("div", "rule it-only", `SID ${r.sid} rev ${r.rev}: ${r.rule}`));
     return li;
   });
   if (!custom.length) custom.push(el("li", "muted small", "None yet."));
@@ -340,7 +345,7 @@ function showJob(j) {
 }
 
 async function startJob(url, body, target) {
-  for (const k in status) delete jobStatus[k];   // only the newest change keeps a status line
+  for (const k in jobStatus) delete jobStatus[k];   // only the newest change keeps a status line
   fieldErrors(form, null, "");
   rulesMsg("", true);
   try {

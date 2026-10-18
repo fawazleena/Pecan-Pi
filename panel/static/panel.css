@@ -98,10 +98,19 @@ h3 { font-size: .95rem; margin: 0 0 8px; }
 .item-error { color: var(--red); font-size: .8rem; margin: 2px 0 0; }
 .add label { display: grid; gap: 2px; font-size: .8rem; color: var(--muted); }
 .add h3 { margin: 8px 0 0; }
-.iplist .rule-row { display: grid; gap: 4px; }
-.iplist .rule-row.off { opacity: .6; }
-.iplist .rule-actions { display: flex; gap: 6px; align-items: center; }
-.add .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; }
+.iplist li.rule-card { flex-wrap: wrap; padding: 10px 12px; }
+.rule-card .rule-text { flex: 1 1 140px; min-width: 0; }
+.rule-card .rule-name { font-weight: 600; }
+.rule-card.off .rule-text { opacity: .55; }
+.off-label { font-size: .7rem; font-weight: 600; text-transform: uppercase; letter-spacing: .04em;
+  background: rgba(15,39,71,.1); color: var(--muted); border-radius: 6px; padding: 1px 6px; vertical-align: 1px; }
+.rule-card .rule-actions { display: flex; gap: 6px; align-items: center; flex: none; margin-left: auto; }
+.rule-card .job, .rule-card .rule { flex-basis: 100%; margin: 0; }
+.iplist button.toggle { display: flex; background: transparent; padding: 4px 0 4px 4px; }
+.toggle:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
+/* Fields line up at the top, so an error under one box never stretches its neighbour. */
+.add .row { display: grid; grid-template-columns: 1fr 1fr; gap: 6px; align-items: start; }
+.add label { align-content: start; }
 .add select { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
 .iplist .rule { font-family: ui-monospace, monospace; font-size: .75rem; color: var(--muted); }
 .add input { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
