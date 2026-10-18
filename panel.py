@@ -62,11 +62,15 @@ def record_fail(ip):
 
 @app.before_request
 def require_login():
-    if request.endpoint in ("login", "static"):
+    if request.endpoint in ("login", "static", "favicon"):
         return
     seen = session.get("seen", 0)
     if not session.get("admin") or time.time() - seen > IDLE_MINUTES * 60:
-        session.clear()
+        # Clear only an expired admin session. Clearing a not-yet-logged-in one would drop the
+        # CSRF token of the login form already on screen (the browser's own /favicon.ico request
+        # did exactly that: "CSRF tokens do not match").
+        if session.get("admin"):
+            session.clear()
         if request.path.startswith("/api/"):
             abort(401)
         return redirect(url_for("login"))
@@ -104,6 +108,11 @@ def login():
             print(f"login failed from {ip}")
             error = "Wrong password."
     return render_template("login.html", error=error), 200 if not error else 401
+
+
+@app.get("/favicon.ico")
+def favicon():
+    return redirect(url_for("static", filename="favicon.svg"))
 
 
 @app.post("/logout")
