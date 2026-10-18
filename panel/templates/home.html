@@ -14,10 +14,15 @@
 <div class="layout">
   <aside class="glass side">
     <h2>Protection</h2>
-    <p class="muted small">Switches arrive in the next update.</p>
-    {% for label in ["Watch for known attacks", "Spot unusual behaviour", "Block intruders automatically", "Explain alerts in plain English"] %}
-    <div class="switch-row disabled"><span>{{ label }}</span><span class="switch" aria-hidden="true"></span></div>
-    {% endfor %}
+    <div id="switches">
+      {% for w in s.switches %}
+      <div class="switch-row disabled">
+        <span>{{ w.label }}{% if w.note %}<br><span class="muted small">{{ w.note }}</span>{% endif %}</span>
+        <span class="switch{{ ' on' if w.on }}" role="img" aria-label="{{ 'On' if w.on else 'Off' }}"></span>
+      </div>
+      {% endfor %}
+    </div>
+    <p id="settings-error" class="error small it-only">{{ s.settings_error or '' }}</p>
     <h2>Services</h2>
     <ul id="services" class="services">
       {% for name, state in s.services.items() %}<li><span class="dot {{ 'ok' if state == 'active' else 'bad' }}"></span>{{ name }}</li>{% endfor %}
@@ -35,6 +40,7 @@
     <section class="glass">
       <h2>What's happening now</h2>
       <ol id="feed" class="feed"></ol>
+      <p id="hidden" class="muted small"></p>
       <p id="updated" class="muted small"></p>
     </section>
   </main>

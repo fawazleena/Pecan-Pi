@@ -14,11 +14,12 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, session, url_for
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
-from netinfo import iface_ips
+from netinfo import iface_ips, load_settings
 
 HERE = Path(__file__).parent
 ENV = HERE / ".env"
 DB = HERE / "pecan.db"
+MODEL = HERE / "anomaly_model.joblib"   # pipeline.py's ANOMALY_MODEL (its working dir is HERE)
 EVE = "/var/log/suricata/eve.json"
 TLS = HERE / "panel" / "tls"
 SERVICES = ("suricata", "pecan-pipeline", "pecan-honeypot")
@@ -30,8 +31,11 @@ STATS_TAIL = 512 * 1024    # bytes of eve.json searched for the latest stats eve
 DROPS_WINDOW = 10 * 60     # kernel_drops rising within this many seconds -> yellow
 
 PLAIN_VERDICT = {"malicious": "Threat", "suspicious": "Worth a look", "benign": "Normal", "unknown": "Not reviewed yet"}
-PLAIN_DETECTION = {"signature": "Known attack pattern", "anomaly": "Unusual behaviour",
+PLAIN_DETECTION = {"signature": "Rule match", "anomaly": "Unusual behaviour",
                    "honeypot": "Someone tried the trap door", "recon": "Security check result"}
+NORMAL_VERDICTS = ("benign", "normal")   # hidden in Simple mode
+SWITCH_LABELS = {"signatures": "Watch for known attacks", "anomaly": "Spot unusual behaviour",
+                 "auto_block": "Block intruders automatically", "ai": "Explain alerts in plain English"}
 CACHE_PREFIXES = ("[cached] ", "[backfill] ", "[retriage] ")
 
 load_dotenv(ENV)
@@ -160,6 +164,31 @@ def plain_reason(reason):
     return reason[:1].upper() + reason[1:]
 
 
+def plain_kind(detection, verdict):
+    # A rule firing is not an attack by itself: say "attack" only once the AI judged it one.
+    if detection == "signature" and verdict in ("suspicious", "malicious"):
+        return "Known attack pattern"
+    return PLAIN_DETECTION.get(detection, detection)
+
+
+def switches():
+    """The real state of each main switch, from /etc/pecan/settings.json."""
+    settings, error = load_settings()
+    out = [{"name": k, "label": SWITCH_LABELS[k], "on": settings[k], "available": True, "note": ""}
+           for k in SWITCH_LABELS]
+    if not MODEL.exists():   # the pipeline can't score without a model, whatever the setting says
+        out[1].update(on=False, available=False,
+                      note="Not available yet: still learning what normal looks like on this network.")
+    return out, error
+
+
+def feed_item(r):
+    return {"id": r[0], "time": local_time(r[1]), "detection": r[2], "kind": plain_kind(r[2], r[3]),
+            "verdict": r[3], "plain_verdict": PLAIN_VERDICT.get(r[3], r[3]), "priority": r[4],
+            "signature": r[5], "sid": r[6], "severity": r[7], "src": r[8], "dst": r[9], "count": r[10],
+            "score": r[11], "reason": plain_reason(r[12]), "raw_reason": r[12], "action": r[13]}
+
+
 def status():
     now = datetime.now(timezone.utc)
     hour, day = (now - timedelta(hours=1)).isoformat(), (now - timedelta(days=1)).isoformat()
@@ -172,12 +201,20 @@ def status():
     try:
         (threats,), = query("SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict='malicious' AND priority='high'", (hour,))
         (worth,), = query("SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND (verdict='suspicious' OR priority='medium')", (day,))
-        rows = query("SELECT id, seen_at, detection, verdict, priority, signature, sid, severity, src_ip, dest_ip, "
-                     "count, score, reason, action FROM alerts ORDER BY id DESC LIMIT ?", (FEED_ROWS,))
+        cols = "id, seen_at, detection, verdict, priority, signature, sid, severity, src_ip, dest_ip, count, score, reason, action"
+        normal = ",".join("?" * len(NORMAL_VERDICTS))
+        rows = query(f"SELECT {cols} FROM alerts ORDER BY id DESC LIMIT ?", (FEED_ROWS,))
+        simple_rows = query(f"SELECT {cols} FROM alerts WHERE verdict NOT IN ({normal}) ORDER BY id DESC LIMIT ?",
+                            (*NORMAL_VERDICTS, FEED_ROWS))
+        (hidden,), = query(f"SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict IN ({normal})",
+                           (hour, *NORMAL_VERDICTS))
     except sqlite3.Error as err:
-        threats = worth = 0
-        rows = []
+        threats = worth = hidden = 0
+        rows = simple_rows = []
         problems.append(("red", f"Can't read the alert database ({err})."))
+    sw, settings_error = switches()
+    if settings_error:
+        problems.append(("yellow", "The protection settings file can't be read, so everything is left on."))
     if states["suricata"] != "active":
         problems.append(("red", "Network monitoring is stopped."))
     if states["pecan-pipeline"] != "active":
@@ -194,12 +231,10 @@ def status():
     headline = {"green": "All good. Your network is protected.",
                 "yellow": "Protected, but something needs a look.",
                 "red": "Action needed."}[level]
-    feed = [{"id": r[0], "time": local_time(r[1]), "detection": r[2], "kind": PLAIN_DETECTION.get(r[2], r[2]),
-             "verdict": r[3], "plain_verdict": PLAIN_VERDICT.get(r[3], r[3]), "priority": r[4],
-             "signature": r[5], "sid": r[6], "severity": r[7], "src": r[8], "dst": r[9], "count": r[10],
-             "score": r[11], "reason": plain_reason(r[12]), "raw_reason": r[12], "action": r[13]} for r in rows]
     return {"level": level, "headline": headline, "problems": [p for _, p in problems],
-            "services": states, "kernel_drops": d, "feed": feed}
+            "services": states, "kernel_drops": d, "switches": sw, "settings_error": settings_error,
+            "feed": [feed_item(r) for r in rows], "simple_feed": [feed_item(r) for r in simple_rows],
+            "hidden_last_hour": hidden}
 
 
 def local_time(iso):

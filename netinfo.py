@@ -1,5 +1,5 @@
-"""The Pi's current addresses, looked up at call time (hotspot IPs change), and the
-reconnaissance "scan in progress" marker.
+"""The Pi's current addresses, looked up at call time (hotspot IPs change), the
+reconnaissance "scan in progress" marker, and the panel's main switches.
 
 Standard library only: used by triage.py and by honeypot.py (which runs sandboxed without the
 venv), and the marker is read by anomaly.py and pipeline.py to suppress the Pi's own scans.
@@ -81,3 +81,27 @@ def load_recon_marker(ignore_age=False):
 def recon_covers_dest(marker, dest_ip):
     """True if dest_ip is one of the marker's scan targets (exact IP match on parsed targets)."""
     return bool(marker) and dest_ip in (marker.get("targets") or [])
+
+
+# --- Main switches (panel) --------------------------------------------------------------------
+# Written only by the root-owned pecan-helper (the panel's sudo helper), read by the panel, the
+# pipeline (every 30 s flush) and the honeypot (every hit), so a change needs no restart.
+SETTINGS = Path("/etc/pecan/settings.json")
+SWITCHES = ("signatures", "anomaly", "auto_block", "ai")
+
+
+def load_settings():
+    """(switches, error). A missing file or key means on: that is how the Pi behaved before the
+    panel existed. An unreadable file also falls back to on (fail towards protection) and returns
+    the error, so the panel can say so instead of showing a made-up state."""
+    out = dict.fromkeys(SWITCHES, True)
+    try:
+        data = json.loads(SETTINGS.read_text())
+    except FileNotFoundError:
+        return out, None
+    except (OSError, ValueError) as err:
+        return out, f"{SETTINGS}: {err}"
+    if not isinstance(data, dict):
+        return out, f"{SETTINGS}: not a JSON object"
+    out.update({k: data[k] for k in SWITCHES if isinstance(data.get(k), bool)})
+    return out, None
