@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block body %}
+<main class="login glass">
+  <h1>Pecan Pi</h1>
+  <p class="muted">Sign in to your network protection.</p>
+  <form method="post" action="{{ url_for('login') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <label for="pw">Password</label>
+    <input id="pw" name="password" type="password" maxlength="256" autocomplete="current-password" autofocus required>
+    {% if error %}<p class="error" role="alert">{{ error }}</p>{% endif %}
+    <button type="submit">Sign in</button>
+  </form>
+</main>
+{% endblock %}

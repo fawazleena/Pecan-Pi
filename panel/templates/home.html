@@ -1,0 +1,43 @@
+{% extends "base.html" %}
+{% block body %}
+<header class="top glass">
+  <div class="brand">Pecan Pi</div>
+  <div class="mode" role="group" aria-label="View">
+    <button type="button" data-mode="simple" class="on">Simple</button>
+    <button type="button" data-mode="it">IT</button>
+  </div>
+  <form method="post" action="{{ url_for('logout') }}">
+    <input type="hidden" name="csrf_token" value="{{ csrf_token() }}">
+    <button type="submit" class="link">Sign out</button>
+  </form>
+</header>
+<div class="layout">
+  <aside class="glass side">
+    <h2>Protection</h2>
+    <p class="muted small">Switches arrive in the next update.</p>
+    {% for label in ["Watch for known attacks", "Spot unusual behaviour", "Block intruders automatically", "Explain alerts in plain English"] %}
+    <div class="switch-row disabled"><span>{{ label }}</span><span class="switch" aria-hidden="true"></span></div>
+    {% endfor %}
+    <h2>Services</h2>
+    <ul id="services" class="services">
+      {% for name, state in s.services.items() %}<li><span class="dot {{ 'ok' if state == 'active' else 'bad' }}"></span>{{ name }}</li>{% endfor %}
+    </ul>
+    <p class="it-only small">kernel_drops: <span id="drops">{{ s.kernel_drops }}</span></p>
+  </aside>
+  <main class="centre">
+    <section id="banner" class="glass banner {{ s.level }}" aria-live="polite">
+      <span class="light"></span>
+      <div>
+        <h1 id="headline">{{ s.headline }}</h1>
+        <ul id="problems">{% for p in s.problems %}<li>{{ p }}</li>{% endfor %}</ul>
+      </div>
+    </section>
+    <section class="glass">
+      <h2>What's happening now</h2>
+      <ol id="feed" class="feed"></ol>
+      <p id="updated" class="muted small"></p>
+    </section>
+  </main>
+</div>
+<script src="{{ url_for('static', filename='panel.js') }}"></script>
+{% endblock %}
