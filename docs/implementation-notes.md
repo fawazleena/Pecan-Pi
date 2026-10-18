@@ -414,6 +414,54 @@ excluding `SURICATA` stream/decoder events.
 **Analyst load:** ~240 benign rows per hour from each detector (30 s batches, before merging). That is
 more than the Groq free tier could triage if every anomaly batch needs a call.
 
+#### Ablation study: precision, recall, F1, FPR, ROC-AUC (2026-10-18)
+
+`cic_eval.py metrics` (full tables per attack class in `cic/metrics.txt`). It uses exactly the same flows,
+labels, Monday model and threshold as the results above. Friday is test data only: nothing was retrained
+or retuned. The 14 unlabelled flows (attacker addresses outside every scheduled window) are left out.
+
+What each metric means:
+- **Precision:** of everything the detector flagged, the share that really was an attack.
+- **Recall (detection rate):** of all real attacks, the share the detector flagged.
+- **F1:** one number that is high only when precision *and* recall are both high (their harmonic mean).
+- **False-positive rate (FPR):** of all normal traffic, the share wrongly flagged.
+- **ROC-AUC:** the chance that a random attack flow gets a more suspicious anomaly score than a random normal flow, over every possible threshold (0.5 = guessing, 1.0 = perfect ranking).
+- **Flow level vs event level:** flow level judges every connection; event level asks whether each attack occurrence was noticed at all (18 episodes: one per scheduled window with traffic, one per bot host), and what share of the alert rows an analyst would see (30 s batches) were real.
+
+| Configuration | Flow precision | Flow recall | Flow F1 | FPR | Episodes found | Event precision | False alarms/h |
+|---|---|---|---|---|---|---|---|
+| (a) Anomaly detector | 97.2% | 63.0% | 0.765 | 1.78% | 16 / 18 | 8.6% | 236 |
+| (b) Suricata, Pi's HOME_NET | 27.3% | 0.5% | 0.010 | 1.29% | 8 / 18 | 7.6% | 245 |
+| (c) Suricata, LAN HOME_NET | 30.9% | 0.6% | 0.011 | 1.26% | 12 / 18 | 11.8% | 241 |
+| (d) Anomaly OR (b) | 95.5% | 63.5% | 0.762 | 2.99% | 16 / 18 | 8.1% | 481 |
+| (d) Anomaly OR (c) | 95.5% | 63.5% | 0.763 | 2.95% | 16 / 18 | 10.2% | 477 |
+| (c), real signatures only (no `SURICATA` engine events) | 22.4% | 0.1% | 0.002 | 0.27% | 8 / 18 | 23.8% | 40 |
+
+Per attack class (flow F1; episodes found: anomaly / Suricata LAN / combined):
+
+| Attack | Flows | Anomaly F1 | Anomaly ROC-AUC | Suricata LAN F1 | Anomaly OR LAN F1 | Episodes a / c / d |
+|---|---|---|---|---|---|---|
+| PortScan -sS | 59,127 | 0.962 | 1.000 | 0.002 | 0.939 | 1/1, 1/1, 1/1 |
+| PortScan -sT | 81,177 | 0.972 | 1.000 | 0.001 | 0.954 | 1/1, 1/1, 1/1 |
+| PortScan -sV | 11,153 | 0.827 | 1.000 | 0.006 | 0.742 | 1/1, 1/1, 1/1 |
+| PortScan -sR | 9,129 | 0.796 | 1.000 | 0.006 | 0.702 | 1/1, 1/1, 1/1 |
+| PortScan -sU | 195 | 0.077 | 0.997 | 0.000 | 0.048 | 1/1, 0/1, 1/1 |
+| PortScan -sO | 94 | 0.035 | 0.984 | 0.000 | 0.021 | 1/1, 0/1, 1/1 |
+| PortScan (firewall on) | 383 | 0.117 | 0.976 | 0.002 | 0.074 | 4/4, 3/4, 4/4 |
+| DDoS LOIT | 96,809 | 0.053 | 0.978 | 0.025 | 0.073 | 1/1, 1/1, 1/1 |
+| Botnet ARES (all day) | 2,199 | 0.006 | 0.934 | 0.011 | 0.011 | 4/5, 4/5, 4/5 |
+| All attacks | 260,272 | 0.765 | 0.991 | 0.011 | 0.763 | 16/18, 12/18, 16/18 |
+
+sN (2 flows) and sW (4 flows) are in `cic/metrics.txt` but too small to trust. Small classes get a low
+per-class F1 even at ~100% recall, because they are measured against all ~4,700 benign false positives.
+
+What the ablation shows:
+- **Combining adds almost nothing and doubles false alarms.** Anomaly OR Suricata finds the same 16 of 18 episodes as the anomaly detector alone (both miss sN and one bot) and gains 0.5 points of flow recall (DDoS, Botnet), but false alarms go from ~240/h to ~480/h. The two detectors' false positives barely overlap (FPR 1.78% + 1.26% is about 2.95%).
+- **Suricata's value is the precise signatures.** Without the generic `SURICATA` stream/decoder events it raises 40 false alarms/h (vs ~240) and still finds 8 episodes (sS, sT, sV, sR, DDoS, 3 firewall-on windows) on the LAN HOME_NET. Its 4/5 bot "detections" are only such engine events, not a botnet signature.
+- **The score ranks well; the threshold is the limit.** DDoS (AUC 0.978) and Botnet (0.934) score as more unusual than most normal flows but stay inside the 2% false-positive threshold (recall 2.9% / 1.0%). Lowering the threshold would be tuning on the test day, so it was not done.
+- **Flow precision is flattered by prevalence:** half of Friday's flows are attacks, far more than on a real network. FPR and false alarms per hour are the numbers that carry over to deployment.
+- Event precision (8-12%) means most alert rows an analyst sees are false alarms (before `collapse()` and the AI triage).
+
 **Key contrast with 6.1:** on the *same* network four days later, the false-positive rate held (1.8% vs 2.0%). On a *different* network it did not (61%).
 
 Caveats (from the evaluation): labels from the schedule (time + IP), not per-packet truth; the Monday-trained CIC model measures the method, not the Pi's model; laptop Suricata 7.0.3 + its own rules, default config, no MAC logging.

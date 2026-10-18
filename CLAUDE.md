@@ -152,11 +152,24 @@ Both detectors on public labelled data. Monday pcap (benign) and Friday (attacks
 .venv/bin/python cic_eval.py verify             # schedule vs traffic (writes nothing)
 nice -n 19 .venv/bin/python cic_eval.py train   # Monday -> cic/model.joblib (refuses paths outside cic/)
 nice -n 19 .venv/bin/python cic_eval.py report  # -> cic/results.json (~6 min); keep cic/report.txt via redirect
+nice -n 19 .venv/bin/python cic_eval.py metrics # ablation -> cic/metrics.txt + .json (~7 min; scores Friday, fits nothing)
 ```
 
 - Separate model, same code (`anomaly.fit_model`), same 2% FP budget on held-out Monday; Friday never tunes anything. Labels come from the official UNB schedule, not the CIC CSVs. `verify` showed: page times are ADT (**+3h = UTC**); all scan/DDoS traffic arrives from the firewall's inside address **172.16.0.1** (NAT), so scan vs DDoS is told apart by time only. **Deliberate deviation:** every victim <-> 205.174.165.73:8080 flow is Botnet all day (bots beacon every ~100s until capture end; only 736/2,199 are in the official 10:02-11:02 window; reported separately). Windows with no flows (sF, sX, sP, sA, sL, sI, b) are "can't be evaluated". 12 stray 172.16.0.1 flows are unlabelled.
 - Suricata alerts are joined to flows by direction-free 5-tuple + time (flow_id differs per run); on run (a) this agrees with the flow_id join on 7,790/7,804 alerts.
 - **Results:** Monday held-out FP 2.0% (threshold -0.5862); **Friday benign FP 1.8%** (same network four days later: contrast with the domain-shift finding). Anomaly detects 100% of sS/sT/sV/sR scan flows, 82% firewall-on, 99.5% sU, 89% sO; within 0-76s per scan; DDoS only 2.9% of flows (detected at 7s); Botnet ~1% (first flag after 29 min: effectively missed). Suricata with the Pi's HOME_NET misses most scans (172.16.0.1 counts as "home"); with the LAN HOME_NET it catches sS/sT/sV/sR at 0s, firewall-on at 26s and the DDoS by signature (`ET DOS Terse HTTP GET ... AnonMafiaIC`); neither detector catches the botnet by signature. Benign Suricata alerts 1.3% of flows, 0.3% without `SURICATA` stream/decoder events. Analyst load: ~240 benign rows/h from each detector (30s batches, before `collapse()`), more than the Groq free tier could triage if every anomaly batch is a call.
+- **Ablation (`cic_eval.py metrics`, 2026-10-18; full tables in `cic/metrics.txt`).** Same flows, labels, model and threshold as `report` (shared `load_friday()`); Friday is test-only, nothing refitted. Universe: usable flows minus the 14 unlabelled (262,083 benign, 260,272 attack). Flow level = each flow one decision; per class = that class vs all benign. Event level: 18 episodes (one per schedule window with traffic, one per bot host), recall = episodes with >= 1 detected flow, precision = attack rows / all alert rows (analyst rows: anomaly source x 30 s, Suricata SID x source x 30 s, before `collapse()`), false alarms/h instead of FPR. Overall:
+
+  | Config | Flow prec | Flow recall | Flow F1 | FPR | Episodes | Event prec | False alarms/h |
+  |---|---|---|---|---|---|---|---|
+  | (a) anomaly | 97.2% | 63.0% | 0.765 | 1.78% | 16/18 | 8.6% | 236 |
+  | (b) Suricata, Pi HOME_NET | 27.3% | 0.5% | 0.010 | 1.29% | 8/18 | 7.6% | 245 |
+  | (c) Suricata, LAN HOME_NET | 30.9% | 0.6% | 0.011 | 1.26% | 12/18 | 11.8% | 241 |
+  | (d) anomaly OR (b) | 95.5% | 63.5% | 0.762 | 2.99% | 16/18 | 8.1% | 481 |
+  | (d) anomaly OR (c) | 95.5% | 63.5% | 0.763 | 2.95% | 16/18 | 10.2% | 477 |
+  | (c) signatures only | 22.4% | 0.1% | 0.002 | 0.27% | 8/18 | 23.8% | 40 |
+
+  Anomaly ROC-AUC 0.991 overall; 1.000 sS/sT/sV/sR, 0.997 sU, 0.984 sO, 0.976 firewall-on, 0.978 DDoS, 0.934 Botnet. Findings: the OR adds no episodes over anomaly alone (both miss sN and one bot) but doubles false alarms, since the two detectors' false positives barely overlap (FPR 1.78 + 1.26 ~ 2.95). DDoS and Botnet rank well (AUC > 0.93) but sit inside the 2% threshold (recall 2.9% / 1.0%): a threshold effect, deliberately not tuned on Friday. Suricata's 4/5 bot episodes are only `SURICATA STREAM` engine events. Flow precision is inflated by 50% attack prevalence; FPR and false alarms/h carry over to deployment.
 - The evaluation found `SourceWindow` was O(window) per flow (~15-20 ms/flow during a 30k flows/min scan); fixed to running counts with identical feature vectors (commit 3bf52c9).
 
 ### Step 5 checklist (after collection; rerun for baseline 2)

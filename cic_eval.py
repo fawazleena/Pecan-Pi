@@ -234,10 +234,10 @@ def match_alerts(path, flows, index, by_flow_id=None):
 def pct(n, d):
     return f"{n / d:6.1%}" if d else "     -"
 
-def cmd_report(a):
+def load_friday(a, t0):
+    """Label Friday, score it with the Monday model (live code path) and join both Suricata runs.
+    Shared by report and metrics, so both see exactly the same flows, labels and decisions."""
     import joblib
-    t0 = time.time()
-    out = in_cic(a.out)
     bundle = joblib.load(a.model)
     label = Labeler()
 
@@ -251,8 +251,8 @@ def cmd_report(a):
         # "seen" = when the flow record exists (pipeline can score it). In pcap replay the event
         # timestamp is the flow manager's clock and is sometimes before the flow's end, so take the max.
         flows.append({"label": lab, "in_window": inwin, "start": start.timestamp(), "end": end,
-                      "seen": max(epoch(e["timestamp"]), end), "src": e.get("src_ip"),
-                      "usable": False, "anomaly": False})
+                      "seen": max(epoch(e["timestamp"]), end), "src": e.get("src_ip"), "dst": e.get("dest_ip"),
+                      "usable": False, "anomaly": False, "score": None})
         index[flow_key(e.get("proto"), e.get("src_ip"), e.get("src_port"), e.get("dest_ip"), e.get("dest_port"))].append(i)
         if "flow_id" in e:
             by_flow_id[e["flow_id"]] = i
@@ -263,8 +263,10 @@ def cmd_report(a):
     sc = Scorer(a.model)
     for e in events:
         sc.add(e)
-    for (e, _), flag in zip(sc.buf, sc.flags()):
-        flows[e["_i"]].update(usable=True, anomaly=bool(flag))
+    import numpy as np
+    scores = sc.model.score_samples(np.array([v for _, v in sc.buf], dtype=float))   # same call as Scorer.flags()
+    for (e, _), s in zip(sc.buf, scores):
+        flows[e["_i"]].update(usable=True, anomaly=bool(s < sc.threshold), score=float(s))
     sc.buf = []
     n_excluded = sum(excluded(e) for e in events)
     del events
@@ -276,6 +278,12 @@ def cmd_report(a):
         hits, st = match_alerts(path, flows, index, by_flow_id if name == ALERTS[0][0] else None)
         runs.append((name, hits, st))
         print(f"{name}: {dict(st)}")
+    return bundle, flows, runs, n_excluded
+
+def cmd_report(a):
+    t0 = time.time()
+    out = in_cic(a.out)
+    bundle, flows, runs, n_excluded = load_friday(a, t0)
 
     # 4. tables. Denominators are usable flows (what both detectors see in the pipeline);
     #    the broadcast-filtered rest is reported separately.
@@ -400,6 +408,172 @@ def cmd_report(a):
         json.dump(res, f, indent=1, default=str)
     print(f"\n-> {out} ({time.time() - t0:.0f}s)")
 
+def prf(tp, fp, fn, tn):
+    """precision, recall, F1, false-positive rate (None where the denominator is 0)."""
+    p = tp / (tp + fp) if tp + fp else None
+    r = tp / (tp + fn) if tp + fn else None
+    f1 = 2 * p * r / (p + r) if p and r else (0.0 if p is not None and r is not None else None)
+    fpr = fp / (fp + tn) if fp + tn else None
+    return p, r, f1, fpr
+
+def cmd_metrics(a):
+    """Ablation: precision/recall/F1/FPR per attack class and overall, for the anomaly detector,
+    each Suricata run, and anomaly OR Suricata; ROC-AUC from the anomaly score. Flow level and
+    event level. Friday is test-only: same Monday model and threshold as report, nothing is fitted."""
+    from sklearn.metrics import roc_auc_score
+    t0 = time.time()
+    out, out_json = in_cic(a.out), in_cic(os.path.splitext(a.out)[0] + ".json")
+    bundle, flows, runs, _ = load_friday(a, t0)
+    hits = {rn: h for rn, h, _ in runs}
+    lan = ALERTS[1][0]
+    sig_only = lambda h: {i: hs for i, hs in h.items() if any(sid not in ENGINE_SIDS for _, sid, *_ in hs)}
+    # Detector configurations: name -> (flagged flow indices, alert-row builders)
+    det = {"anomaly": {i for i, f in enumerate(flows) if f["anomaly"]}}
+    for rn in hits:
+        det[f"Suricata {rn}"] = set(hits[rn])
+    for rn in hits:
+        det[f"anomaly OR Suricata {rn}"] = det["anomaly"] | det[f"Suricata {rn}"]
+    lan_sig = sig_only(hits[lan])
+    det[f"Suricata {lan}, sig only"] = set(lan_sig)
+    det[f"anomaly OR Suricata {lan}, sig only"] = det["anomaly"] | set(lan_sig)
+    main_cfgs = list(det)[:5]      # the four ablation arms (b and c are the two Suricata runs)
+
+    # Universe: usable flows (what both detectors see), minus 'unlabelled' (attacker IPs outside any window)
+    use = [i for i, f in enumerate(flows) if f["usable"] and f["label"] != "unlabelled"]
+    ben = [i for i in use if flows[i]["label"] == "benign"]
+    names = [n for n, *_ in SCHEDULE]
+    classes = [("Botnet ARES", lambda f: f["label"] == "Botnet ARES"),
+               ("  in official window", lambda f: f["label"] == "Botnet ARES" and f["in_window"])] + \
+              [(n, (lambda n: lambda f: f["label"] == n)(n)) for n in names[1:]] + \
+              [("ALL ATTACKS", lambda f: f["label"] in names)]
+    hours = (max(f["seen"] for f in flows) - min(f["start"] for f in flows)) / 3600
+    res = {"model": {k: bundle.get(k) for k in ("threshold", "fp_budget", "n_fit", "n_calib", "calib_fp")},
+           "universe": {"usable_flows": sum(f["usable"] for f in flows), "benign": len(ben),
+                        "attack": len(use) - len(ben),
+                        "unlabelled_excluded": sum(f["usable"] and f["label"] == "unlabelled" for f in flows),
+                        "hours": round(hours, 2)},
+           "flow": {}, "event": {}}
+
+    # ---- flow level: each flow is one decision. Per class = that class vs all benign flows.
+    n_ben = len(ben)
+    fp_of = {c: sum(i in s for i in ben) for c, s in det.items()}
+    ben_scores = [-flows[i]["score"] for i in ben]          # lower score_samples = more anomalous
+    for cname, sel in classes:
+        pos = [i for i in use if sel(flows[i])]
+        if not pos:
+            continue
+        r = {"n": len(pos)}
+        for c, s in det.items():
+            tp = sum(i in s for i in pos)
+            p, rec, f1, fpr = prf(tp, fp_of[c], len(pos) - tp, n_ben - fp_of[c])
+            r[c] = {"tp": tp, "fp": fp_of[c], "precision": p, "recall": rec, "f1": f1, "fpr": fpr}
+        r["anomaly_roc_auc"] = roc_auc_score([1] * len(pos) + [0] * n_ben,
+                                             [-flows[i]["score"] for i in pos] + ben_scores)
+        res["flow"][cname] = r
+
+    # ---- event level. Episode = one attack occurrence: one schedule window with traffic (firewall-on: 12 windows, 4 with flows), or one
+    # bot host for the botnet. Alert row = what an analyst sees: anomaly per (source, 30s batch), Suricata
+    # per (SID, source, 30s batch), as in report's analyst load. A row is an attack row if any of its flows
+    # is an attack flow, a false alarm if all are benign; rows with only unlabelled flows are dropped.
+    lab = Labeler()
+    def episode(f):
+        if f["label"] == "Botnet ARES":
+            return ("Botnet ARES", f["dst"] if f["src"] == BOTNET_CC else f["src"])
+        t = f["start"]
+        return min((min(abs(t - ws.timestamp()), abs(t - we.timestamp())), (n, ws.isoformat()))
+                   for ws, we, n in lab.web if n == f["label"])[1]
+    ep_of = {i: episode(flows[i]) for i in use if flows[i]["label"] != "benign"}
+    usable = set(use)
+    rows_an = defaultdict(set)
+    for i in det["anomaly"] & usable:
+        rows_an[("A", flows[i]["src"], int(flows[i]["seen"] // BATCH))].add(i)
+    def rows_su(h):
+        rows = defaultdict(set)
+        for i, hs in h.items():
+            if i in usable:
+                for t, sid, *_ in hs:
+                    rows[("S", sid, flows[i]["src"], int(t // BATCH))].add(i)
+        return rows
+    row_sets = {"anomaly": rows_an}
+    for rn in hits:
+        row_sets[f"Suricata {rn}"] = rows_su(hits[rn])
+    for rn in hits:
+        row_sets[f"anomaly OR Suricata {rn}"] = {**rows_an, **row_sets[f"Suricata {rn}"]}
+    row_sets[f"Suricata {lan}, sig only"] = rs = rows_su({i: [x for x in hs if x[1] not in ENGINE_SIDS]
+                                                          for i, hs in lan_sig.items()})
+    row_sets[f"anomaly OR Suricata {lan}, sig only"] = {**rows_an, **rs}
+    for cname, sel in classes:
+        eps = {ep_of[i] for i in use if sel(flows[i]) and i in ep_of}
+        if not eps:
+            continue
+        r = {"episodes": len(eps)}
+        for c, rows in row_sets.items():
+            hit_eps = {ep_of[i] for i in det[c] & usable if i in ep_of and sel(flows[i])}
+            att = sum(any(i in ep_of and sel(flows[i]) for i in fs) for fs in rows.values())
+            fa = sum(all(flows[i]["label"] == "benign" for i in fs) for fs in rows.values())
+            p = att / (att + fa) if att + fa else None
+            rec = len(hit_eps) / len(eps)
+            r[c] = {"episodes_detected": len(hit_eps), "attack_rows": att, "false_alarm_rows": fa,
+                    "precision": p, "recall": rec,
+                    "f1": 2 * p * rec / (p + rec) if p and rec else 0.0, "false_alarms_per_h": fa / hours}
+        res["event"][cname] = r
+
+    # ---- text
+    lines = []
+    w = lines.append
+    f3 = lambda v: "    -" if v is None else f"{v:.3f}"
+    pc = lambda v, d=1: "     -" if v is None else f"{v * 100:.{d}f}%"
+    u = res["universe"]
+    w("CIC-IDS2017 Friday: ablation metrics (cic_eval.py metrics). Test-only: Monday model + threshold, nothing refitted.")
+    w(f"Model: threshold {bundle['threshold']:.4f} (2% FP budget on held-out Monday, FP {bundle.get('calib_fp', 0):.1%}).")
+    w(f"Universe: {u['usable_flows']} usable flows (after broadcast/multicast filter) minus {u['unlabelled_excluded']} "
+      f"unlabelled -> {u['benign']} benign + {u['attack']} attack flows, {u['hours']} h.")
+    w("Botnet = victim <-> 205.174.165.73:8080 all day (deliberate deviation, see report); '  in official window' = 10:02-11:02 subset.")
+    w("Per-class precision is 'this class vs all benign flows': it depends on how many flows the class has, so")
+    w("compare it across detectors on the same row, not across rows. FPR is the same for every class (benign flows only).")
+    w("Classes with < 30 flows (sN, sW) are shown but too small to trust. sF sX sP sA sL sI b had no flows.")
+    w("Overall flow precision is flattered by prevalence: half of Friday's flows are attacks (a real network has far")
+    w("fewer), so FPR and false alarms per hour are the numbers that carry over to deployment.\n")
+    w("Configurations: (a) anomaly  (b) Suricata Pi config (HOME_NET = all RFC1918)  (c) Suricata LAN HOME_NET (192.168.10.0/24)")
+    w("  (d) anomaly OR Suricata, with (b) or (c). Extra: 'sig only' = Suricata without SURICATA stream/decoder events (SIDs 22xxxxx).\n")
+
+    w("== FLOW LEVEL (each flow is one decision) ==")
+    hdr = f"  {'class':<24} {'flows':>7}  {'config':<38} {'prec':>7} {'recall':>7} {'F1':>6} {'FPR':>7}"
+    for cname, r in res["flow"].items():
+        w(hdr if cname == next(iter(res["flow"])) else "")
+        for k, c in enumerate(det if cname == "ALL ATTACKS" else main_cfgs):
+            m = r[c]
+            w(f"  {cname if k == 0 else '':<24} {r['n'] if k == 0 else '':>7}  {c:<38} {pc(m['precision']):>7} "
+              f"{pc(m['recall']):>7} {f3(m['f1']):>6} {pc(m['fpr'], 2):>7}")
+    w("\nAnomaly ROC-AUC (continuous score, class vs benign; 0.5 = coin toss, 1.0 = perfect ranking):")
+    for cname, r in res["flow"].items():
+        w(f"  {cname:<24} {r['anomaly_roc_auc']:.3f}")
+
+    w("\n== EVENT LEVEL ==")
+    w("Episode = one attack occurrence (a schedule window with traffic: firewall-on has 12 windows, 4 with flows;")
+    w("  botnet = one per bot host).")
+    w("Recall = episodes with >= 1 detected flow. Precision = attack rows / all alert rows, rows as the analyst")
+    w("sees them (anomaly: source x 30 s batch; Suricata: SID x source x 30 s batch; before collapse()).")
+    w("FPR has no event-level form (benign 'events' cannot be counted), so false alarms per hour are shown instead.")
+    w("Event F1 combines row precision with episode recall (different units): read it as a summary, not a rate.")
+    hdr = f"  {'class':<24} {'eps':>4}  {'config':<38} {'det':>4} {'prec':>7} {'recall':>7} {'F1':>6} {'FA/h':>7}"
+    for cname, r in res["event"].items():
+        w(hdr if cname == next(iter(res["event"])) else "")
+        for k, c in enumerate(row_sets if cname == "ALL ATTACKS" else main_cfgs):
+            m = r[c]
+            w(f"  {cname if k == 0 else '':<24} {r['episodes'] if k == 0 else '':>4}  {c:<38} {m['episodes_detected']:>4} "
+              f"{pc(m['precision']):>7} {pc(m['recall']):>7} {f3(m['f1']):>6} {m['false_alarms_per_h']:>7.1f}")
+    w("\nCaveats: labels from the CIC schedule (time + IP), not per-packet truth; Monday-trained CIC model (measures the")
+    w("method, not the Pi's model); Suricata 7.0.3 + laptop ET Open rules. Flow-level recall undersells signatures")
+    w("(a scan rule fires once per threshold, not per flow): use event level to compare Suricata.")
+    text = "\n".join(lines)
+    print("\n" + text)
+    with open(out, "w") as f:
+        f.write(text + "\n")
+    with open(out_json, "w") as f:
+        json.dump(res, f, indent=1)
+    print(f"\n-> {out}, {out_json} ({time.time() - t0:.0f}s)")
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -420,8 +594,14 @@ def main():
                    help=f"Suricata alert file(s); default: {', '.join(n for n, _ in ALERTS)}")
     r.add_argument("--out", default=RESULTS)
     r.set_defaults(func=cmd_report)
+    m = sub.add_parser("metrics", help="ablation: precision/recall/F1/FPR + ROC-AUC -> cic/metrics.txt (+ .json)")
+    m.add_argument("--friday", default=FRIDAY)
+    m.add_argument("--model", default=MODEL)
+    m.add_argument("--alerts", nargs=2, action="append", metavar=("NAME", "FILE"))
+    m.add_argument("--out", default=os.path.join(DIR, "metrics.txt"))
+    m.set_defaults(func=cmd_metrics)
     a = ap.parse_args()
-    if a.cmd == "report" and not a.alerts:
+    if a.cmd in ("report", "metrics") and not a.alerts:
         a.alerts = ALERTS
     a.func(a)
 
