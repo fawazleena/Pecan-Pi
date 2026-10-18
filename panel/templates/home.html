@@ -29,7 +29,10 @@
     <ul id="services" class="services">
       {% for name, state in s.services.items() %}<li><span class="dot {{ 'ok' if state == 'active' else 'bad' }}"></span>{{ name }}</li>{% endfor %}
     </ul>
-    <p class="it-only small">kernel_drops: <span id="drops">{{ s.kernel_drops }}</span></p>
+    <div class="it-only system-box">
+      <h2>System</h2>
+      <dl id="system" class="system"></dl>
+    </div>
   </aside>
   <main class="centre">
     <section id="banner" class="glass banner {{ s.level }}" aria-live="polite">
@@ -39,11 +42,28 @@
         <ul id="problems">{% for p in s.problems %}<li>{{ p }}</li>{% endfor %}</ul>
       </div>
     </section>
-    <section class="glass">
-      <h2>What's happening now</h2>
+    <section class="glass" id="feed-box">
+      <div class="feed-head">
+        <h2>What's happening now</h2>
+        <span id="updated" class="muted small" aria-live="off"></span>
+        <button type="button" id="pause" class="small-btn" aria-pressed="false">Pause</button>
+      </div>
+      <form id="filters" class="filters it-only" role="search">
+        <select name="detection" aria-label="Detection">
+          <option value="">All detections</option><option value="signature">signature</option>
+          <option value="anomaly">anomaly</option><option value="honeypot">honeypot</option><option value="recon">recon</option>
+        </select>
+        <select name="verdict" aria-label="Verdict">
+          <option value="">All verdicts</option><option value="malicious">malicious</option>
+          <option value="suspicious">suspicious</option><option value="benign">benign</option>
+          <option value="unknown">unknown (no AI verdict)</option>
+        </select>
+        <input name="q" type="search" placeholder="Signature, IP, SID or reason" maxlength="64" aria-label="Search">
+      </form>
+      <button type="button" id="new-rows" class="new-rows" hidden></button>
       <ol id="feed" class="feed"></ol>
+      <button type="button" id="older" class="link" hidden>Show older</button>
       <p id="hidden" class="muted small"></p>
-      <p id="updated" class="muted small"></p>
     </section>
     <section class="glass" id="lists">
       <h2>Trusted and blocked</h2>

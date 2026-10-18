@@ -7,7 +7,7 @@ the root-owned pecan-helper (one sudoers line, fixed subcommands, argv only, nev
     .venv/bin/python panel.py make-cert        # self-signed TLS cert -> panel/tls/ (gitignored)
     .venv/bin/python panel.py serve [--host IP] [--port 8443]   # default host: the Pi's tailscale0 IP
 """
-import argparse, getpass, json, os, re, secrets, sqlite3, subprocess, sys, threading, time
+import argparse, getpass, json, os, re, secrets, shutil, sqlite3, subprocess, sys, threading, time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from dotenv import load_dotenv
@@ -27,7 +27,8 @@ SERVICES = ("suricata", "pecan-pipeline", "pecan-honeypot")
 PORT = 8443
 IDLE_MINUTES = 30          # logged out after this long without a page load or change (polling doesn't count)
 MAX_FAILS, FAIL_WINDOW = 5, 15 * 60   # login attempts per client IP per 15 min
-FEED_ROWS = 15
+FEED_ROWS = 15            # rows in the first /api/feed answer and per "Show older"
+FEED_MAX = 200            # most new rows one live-feed answer carries; more -> the page starts over
 STATS_TAIL = 512 * 1024    # bytes of eve.json searched for the latest stats event
 DROPS_WINDOW = 10 * 60     # kernel_drops rising within this many seconds -> yellow
 
@@ -38,6 +39,9 @@ NORMAL_VERDICTS = ("benign", "normal")   # hidden in Simple mode
 # Also hidden in Simple mode, as one "not yet explained" line: 'unknown' covers every row without
 # an AI verdict (AI unavailable, AI explanations off, unparsed answers).
 UNEXPLAINED = "unknown"
+# IT-mode feed filters: fixed words only, mapped to SQL here (benign covers the old 'normal').
+VERDICT_FILTERS = {"malicious": ("malicious",), "suspicious": ("suspicious",),
+                   "benign": NORMAL_VERDICTS, "unknown": (UNEXPLAINED,)}
 # Rows where the firewall acted (honeypot.block() results) are always shown: the block stands
 # whatever the AI says, or whether it said anything. COALESCE: a NULL action must count as "no".
 FIREWALL_ACTED = "COALESCE(action LIKE 'blocked %' OR action = 'already blocked' OR action LIKE 'block failed%', 0)"
@@ -244,11 +248,51 @@ def switches():
     return out, error
 
 
+FEED_COLS = ("id, seen_at, detection, verdict, priority, signature, sid, severity, src_ip, dest_ip, count, "
+             "score, reason, action, n_src, n_dest, group_key")
+
+
 def feed_item(r):
     return {"id": r[0], "time": local_time(r[1]), "detection": r[2], "kind": plain_kind(r[2], r[3]),
             "verdict": r[3], "plain_verdict": PLAIN_VERDICT.get(r[3], r[3]), "priority": r[4],
             "signature": r[5], "sid": r[6], "severity": r[7], "src": r[8], "dst": r[9], "count": r[10],
-            "score": r[11], "reason": plain_reason(r[12]), "raw_reason": r[12], "action": r[13]}
+            "score": r[11], "reason": plain_reason(r[12]), "raw_reason": r[12], "action": r[13],
+            "n_src": r[14], "n_dest": r[15], "group_key": r[16]}
+
+
+def feed(view, after=None, before=None, detection=None, verdict=None, search=None):
+    """Feed rows, newest first. after: only rows newer than that id (the live poll); before: older
+    rows ("Show older"); neither: the newest page. 'cursor' is the newest id in the table when
+    this ran, so the next poll asks for rows after it even if the filters matched none."""
+    where, args = [], []
+    if view == "simple":   # what Simple mode hides is counted by status() instead
+        normal = ",".join("?" * len(NORMAL_VERDICTS))
+        where.append(f"(verdict NOT IN ({normal}, ?) OR {FIREWALL_ACTED})")
+        args += [*NORMAL_VERDICTS, UNEXPLAINED]
+    else:
+        if detection:
+            where.append("detection = ?")
+            args.append(detection)
+        if verdict:
+            where.append(f"verdict IN ({','.join('?' * len(VERDICT_FILTERS[verdict]))})")
+            args += VERDICT_FILTERS[verdict]
+        if search:   # a literal substring: LIKE's own wildcards are escaped
+            like = "%" + re.sub(r"([\\%_])", r"\\\1", search) + "%"
+            where.append("(signature LIKE ? ESCAPE '\\' OR src_ip LIKE ? ESCAPE '\\' OR dest_ip LIKE ? ESCAPE '\\' "
+                         "OR reason LIKE ? ESCAPE '\\' OR CAST(sid AS TEXT) = ?)")
+            args += [like] * 4 + [search]
+    (cursor,), = query("SELECT COALESCE(MAX(id), 0) FROM alerts")
+    if after is not None:
+        where.append("id > ? AND id <= ?")
+        args += [after, cursor]
+    if before is not None:
+        where.append("id < ?")
+        args.append(before)
+    limit = FEED_MAX if after is not None else FEED_ROWS
+    rows = query(f"SELECT {FEED_COLS} FROM alerts {'WHERE ' + ' AND '.join(where) if where else ''} "
+                 f"ORDER BY id DESC LIMIT ?", (*args, limit + 1))
+    # One row more than asked tells whether there is more: older rows, or a gap in the live feed.
+    return {"rows": [feed_item(r) for r in rows[:limit]], "more": len(rows) > limit, "cursor": cursor}
 
 
 def status():
@@ -263,20 +307,15 @@ def status():
     try:
         (threats,), = query("SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict='malicious' AND priority='high'", (hour,))
         (worth,), = query("SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND (verdict='suspicious' OR priority='medium')", (day,))
-        cols = "id, seen_at, detection, verdict, priority, signature, sid, severity, src_ip, dest_ip, count, score, reason, action"
         normal = ",".join("?" * len(NORMAL_VERDICTS))
-        rows = query(f"SELECT {cols} FROM alerts ORDER BY id DESC LIMIT ?", (FEED_ROWS,))
-        simple_rows = query(f"SELECT {cols} FROM alerts WHERE verdict NOT IN ({normal}, ?) "
-                            f"OR {FIREWALL_ACTED} ORDER BY id DESC LIMIT ?",
-                            (*NORMAL_VERDICTS, UNEXPLAINED, FEED_ROWS))
+        (last_block,), = query(f"SELECT COALESCE(MAX(id), 0) FROM alerts WHERE action LIKE 'blocked %'")
         (hidden,), = query(f"SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict IN ({normal}) "
                            f"AND NOT {FIREWALL_ACTED}",
                            (hour, *NORMAL_VERDICTS))
         (unexplained,), = query(f"SELECT COUNT(*) FROM alerts WHERE seen_at >= ? AND verdict = ? "
                                 f"AND NOT {FIREWALL_ACTED}", (hour, UNEXPLAINED))
     except sqlite3.Error as err:
-        threats = worth = hidden = unexplained = 0
-        rows = simple_rows = []
+        threats = worth = hidden = unexplained = last_block = 0
         problems.append(("red", f"Can't read the alert database ({err})."))
     sw, settings_error = switches()
     if settings_error:
@@ -304,8 +343,7 @@ def status():
                 "red": "Action needed."}[level]
     return {"level": level, "headline": headline, "problems": [p for _, p in problems],
             "services": states, "kernel_drops": d, "switches": sw, "settings_error": settings_error,
-            "feed": [feed_item(r) for r in rows], "simple_feed": [feed_item(r) for r in simple_rows],
-            "hidden_last_hour": hidden, "unexplained_last_hour": unexplained}
+            "last_block": last_block, "hidden_last_hour": hidden, "unexplained_last_hour": unexplained}
 
 
 def local_time(iso):
@@ -323,6 +361,77 @@ def home():
 @app.get("/api/status")
 def api_status():
     return jsonify(status())
+
+
+@app.get("/api/feed")
+def api_feed():
+    a = request.args
+    view, detection, verdict = a.get("view", "simple"), a.get("detection") or None, a.get("verdict") or None
+    search = (a.get("q") or "").strip() or None
+    after, before = a.get("after", type=int), a.get("before", type=int)
+    if (view not in ("simple", "it") or (detection and detection not in PLAIN_DETECTION)
+            or (verdict and verdict not in VERDICT_FILTERS) or (search and len(search) > 64)):
+        abort(400)
+    try:
+        return jsonify(feed(view, after, before, detection, verdict, search))
+    except sqlite3.Error as err:
+        return jsonify(error=f"Can't read the alert database ({err})."), 503
+
+
+# --- IT mode: system figures ------------------------------------------------------------------
+def size(n):
+    for unit in ("B", "KB", "MB", "GB"):
+        if n < 1024 or unit == "GB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1024
+
+
+def system_info():
+    """(group, label, value) rows for the IT-mode System card. Every figure is read without root;
+    one that can't be read is shown as 'n/a' rather than failing the card."""
+    rows = []
+    st = latest_stats()
+    cap = st.get("capture", {})
+    pkts, dropped = cap.get("kernel_packets"), cap.get("kernel_drops")
+    rows += [("Suricata", "uptime", f"{st['uptime'] // 3600}h {st['uptime'] % 3600 // 60}m" if "uptime" in st else "n/a"),
+             ("Suricata", "packets", f"{pkts:,}" if pkts is not None else "n/a"),
+             ("Suricata", "kernel_drops", f"{dropped:,}" + (f" ({100 * dropped / pkts:.2f}%)" if pkts else "")
+              if dropped is not None else "n/a"),
+             ("Suricata", "flows active", str(st.get("flow", {}).get("active", "n/a")))]
+    pid = subprocess.run(["systemctl", "show", "suricata", "-p", "MainPID", "--value"],
+                         capture_output=True, text=True).stdout.strip()
+    rss = re.search(r"VmRSS:\s+(\d+) kB", read_file(f"/proc/{pid}/status")) if pid not in ("", "0") else None
+    rows.append(("Suricata", "memory (RSS)", size(int(rss.group(1)) * 1024) if rss else "n/a"))
+    try:
+        rows.append(("Suricata", "eve.json", size(os.stat(EVE).st_size)))
+    except OSError:
+        rows.append(("Suricata", "eve.json", "n/a"))
+    mem = dict(re.findall(r"^(\w+):\s+(\d+) kB", read_file("/proc/meminfo"), re.M))
+    temp = read_file("/sys/class/thermal/thermal_zone0/temp").strip()
+    disk = shutil.disk_usage("/")
+    rows += [("Pi", "load (1/5/15 min)", " ".join(read_file("/proc/loadavg").split()[:3]) or "n/a"),
+             ("Pi", "CPU temperature", f"{int(temp) / 1000:.1f} °C" if temp.isdigit() else "n/a"),
+             ("Pi", "memory available", f"{size(int(mem['MemAvailable']) * 1024)} of {size(int(mem['MemTotal']) * 1024)}"
+              if "MemAvailable" in mem else "n/a"),
+             ("Pi", "disk free", f"{size(disk.free)} of {size(disk.total)}")]
+    try:
+        hour = (datetime.now(timezone.utc) - timedelta(hours=1)).isoformat()
+        (total, last_hour, newest), = query("SELECT COUNT(*), SUM(seen_at >= ?), MAX(seen_at) FROM alerts", (hour,))
+        rows += [("Pipeline", "alert rows", f"{total:,} ({last_hour or 0} in the last hour)"),
+                 ("Pipeline", "newest row", local_time(newest) if newest else "none")]
+    except sqlite3.Error:
+        rows.append(("Pipeline", "alert rows", "n/a"))
+    # The pipeline logs Groq's rate-limit headers on every call (needs journal access: group adm).
+    line = subprocess.run(["journalctl", "-u", "pecan-pipeline", "--since", "-24h", "--grep", "groq limits",
+                           "-n", "1", "-o", "short-iso", "--no-pager", "-q"], capture_output=True, text=True).stdout.strip()
+    rows.append(("Pipeline", "Groq limits", f"{line.split('groq limits: ', 1)[-1]} (at {local_time(line.split()[0])})"
+                 if "groq limits: " in line else "no call in the last 24 h"))
+    return rows
+
+
+@app.get("/api/system")
+def api_system():
+    return jsonify(rows=system_info())
 
 
 # --- switches -------------------------------------------------------------------------------
@@ -582,7 +691,7 @@ def api_rules_custom():
 # --- setup commands ---------------------------------------------------------------------------
 def set_env(updates):
     """Replace or append KEY='value' lines in .env, keeping everything else (GROQ_API_KEY)."""
-    lines = ENV.read_text().splitlines() if ENV.exists() else []
+    lines = ENV.read_file().splitlines() if ENV.exists() else []
     lines = [l for l in lines if l.split("=", 1)[0].strip() not in updates]
     # Single quotes: python-dotenv does no $-interpolation inside them (scrypt hashes contain '$').
     lines += [f"{k}='{v}'" for k, v in updates.items()]

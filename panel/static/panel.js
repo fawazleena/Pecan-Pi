@@ -12,11 +12,14 @@ function el(tag, cls, text) {
 }
 
 function setMode(m) {
+  const changed = m !== mode || feedCursor === null;
   mode = m;
   document.body.classList.toggle("it", mode === "it");
   document.querySelectorAll(".mode button").forEach(b => b.classList.toggle("on", b.dataset.mode === mode));
   try { localStorage.setItem("pecan-mode", mode); } catch (e) { /* storage blocked: fine */ }
   if (last) render(last);
+  if (changed) restartFeed();   // the two views ask the Pi for different rows
+  if (mode === "it") loadSystem();
 }
 
 function renderSwitches(list) {
@@ -62,12 +65,11 @@ async function toggle(row) {
   }
 }
 
-let lastBlockRow = null;   // newest feed row where the firewall blocked someone
+let lastBlock = null;   // newest alert row where the firewall blocked someone
 function render(s) {
   last = s;
-  const blockRow = Math.max(0, ...s.feed.filter(f => f.action && f.action.startsWith("blocked")).map(f => f.id));
-  if (lastBlockRow !== null && blockRow > lastBlockRow) loadLists();   // a new timed block: show it
-  lastBlockRow = blockRow;
+  if (lastBlock !== null && s.last_block > lastBlock) loadLists();   // a new timed block: show it
+  lastBlock = s.last_block;
   const banner = document.getElementById("banner");
   banner.className = "glass banner " + s.level;
   document.getElementById("headline").textContent = s.headline;
@@ -77,29 +79,14 @@ function render(s) {
     li.append(el("span", "dot " + (state === "active" ? "ok" : "bad")), name);
     return li;
   }));
-  document.getElementById("drops").textContent = s.kernel_drops;
   renderSwitches(s.switches);
   document.getElementById("settings-error").textContent = s.settings_error || "";
   // Simple mode leaves out rows the AI judged normal or hasn't explained (unless the firewall
-  // blocked someone: those always show), and says how many of
-  // each; IT mode shows everything.
-  const simple = mode === "simple";
+  // blocked someone: those always show), and says how many of each; IT mode shows everything.
   const n = s.hidden_last_hour, u = s.unexplained_last_hour;
-  document.getElementById("hidden").textContent = simple ? [
+  document.getElementById("hidden").textContent = mode === "simple" ? [
     n ? `${n} normal event${n === 1 ? "" : "s"} hidden (last hour)` : "",
     u ? `${u} alert${u === 1 ? "" : "s"} not yet explained (last hour)` : ""].filter(Boolean).join(" · ") : "";
-  document.getElementById("feed").replaceChildren(...(simple ? s.simple_feed : s.feed).map(f => {
-    const li = el("li", f.verdict);
-    li.append(el("div", "meta", `${f.time} · ${f.kind} · ${f.plain_verdict}`));
-    li.append(el("div", "", f.reason || "No explanation yet."));
-    if (f.action) li.append(el("div", "meta", "Firewall: " + f.action));
-    const raw = el("div", "raw it-only",
-      `${f.signature}${f.sid ? " [SID " + f.sid + "]" : ""}${f.severity ? " sev " + f.severity : ""}` +
-      `${f.score !== null ? " score " + f.score : ""} · ${f.src} -> ${f.dst} x${f.count} · ${f.priority}`);
-    li.append(raw);
-    return li;
-  }));
-  document.getElementById("updated").textContent = "Updated " + new Date().toLocaleTimeString();
 }
 
 async function refresh() {
@@ -107,10 +94,163 @@ async function refresh() {
     const r = await fetch("/api/status", { credentials: "same-origin" });
     if (r.status === 401) { location.href = "/login"; return; }
     if (r.ok) render(await r.json());
-  } catch (e) {
-    document.getElementById("updated").textContent = "Can't reach the Pi. Retrying...";
-  }
+  } catch (e) { /* the feed line already says the Pi can't be reached */ }
 }
+
+// --- Live feed: the newest page first, then every 2 s only the rows newer than the last
+// answer's cursor (one small query; polling keeps the normal login and idle-logout checks,
+// which a held-open stream would bypass). Simple mode: plain cards. IT mode: one dense row per
+// alert with every stored field behind a click, and filters. Paused: new rows wait behind an
+// "N new" button so nothing moves while someone reads.
+const FEED_MS = 2000, FEED_KEEP = 300;
+let feedRows = [], feedCursor = null, feedMore = false, feedGen = 0, paused = false, pending = [];
+const opened = new Set();   // ids of IT rows whose details are open
+const filters = document.getElementById("filters");
+
+async function getFeed(extra) {
+  const p = new URLSearchParams({ view: mode });
+  if (mode === "it") for (const k of ["detection", "verdict", "q"]) {
+    const v = filters.elements[k].value.trim();
+    if (v) p.set(k, v);
+  }
+  for (const [k, v] of Object.entries(extra)) p.set(k, v);
+  const r = await fetch("/api/feed?" + p, { credentials: "same-origin" });
+  if (r.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  const d = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(d.error || "The alert list can't be read.");
+  return d;
+}
+
+function feedLine(text) { document.getElementById("updated").textContent = text; }
+
+// Start over (page load, mode or filter change, or too many new rows at once). A generation
+// number retires the previous loop: its answer is dropped and it doesn't schedule itself again.
+function restartFeed() {
+  const gen = ++feedGen;
+  feedRows = []; pending = []; feedCursor = null; feedMore = false;
+  renderFeed(new Set());
+  feedLine("Loading...");
+  feedTick(gen);
+}
+
+async function feedTick(gen) {
+  try {
+    const d = await getFeed(feedCursor === null ? {} : { after: feedCursor });
+    if (gen !== feedGen) return;
+    if (feedCursor === null) {
+      feedRows = d.rows; feedMore = d.more; feedCursor = d.cursor;
+      renderFeed(new Set());
+    } else if (d.more) {   // more new rows than one answer carries: reload the newest page
+      feedCursor = null; feedRows = []; pending = [];
+    } else {
+      feedCursor = d.cursor;
+      if (d.rows.length && paused) { pending = d.rows.concat(pending); renderPending(); }
+      else if (d.rows.length) addRows(d.rows);
+    }
+    feedLine((paused ? "Paused" : "Live") + " · " + new Date().toLocaleTimeString());
+  } catch (e) {
+    if (gen !== feedGen) return;
+    feedLine(e.message === "Failed to fetch" ? "Can't reach the Pi. Retrying..." : e.message);
+  }
+  setTimeout(() => gen === feedGen && feedTick(gen), FEED_MS);
+}
+
+function addRows(rows) {
+  feedRows = rows.concat(feedRows);
+  if (feedRows.length > FEED_KEEP) { feedRows.length = FEED_KEEP; feedMore = true; }
+  renderFeed(new Set(rows.map(r => r.id)));
+}
+
+function simpleCard(f) {
+  const li = el("li", f.verdict);
+  li.append(el("div", "meta", `${f.time} · ${f.kind} · ${f.plain_verdict}`));
+  li.append(el("div", "", f.reason || "No explanation yet."));
+  if (f.action) li.append(el("div", "meta", "Firewall: " + f.action));
+  return li;
+}
+
+function itRow(f) {
+  const li = el("li", "row " + f.verdict);
+  const det = el("details");
+  det.open = opened.has(f.id);
+  det.addEventListener("toggle", () => { if (det.open) opened.add(f.id); else opened.delete(f.id); });
+  const sum = el("summary");
+  sum.append(el("span", "c-time", f.time), el("span", "c-det", f.detection),
+             el("span", "c-verdict", `${f.verdict}/${f.priority}`), el("span", "c-sig", f.signature || ""),
+             el("span", "c-flow", `${f.src || "?"} → ${f.dst || "?"}`), el("span", "c-count", "×" + f.count));
+  const dl = el("dl");
+  const add = (k, v) => { if (v !== null && v !== undefined && v !== "") dl.append(el("dt", "", k), el("dd", "", String(v))); };
+  add("row", f.id); add("SID", f.sid); add("severity", f.severity); add("score", f.score);
+  add("sources / destinations", f.n_src || f.n_dest ? `${f.n_src || 1} / ${f.n_dest || 1}` : "");
+  add("group", f.group_key); add("firewall", f.action); add("AI reason", f.raw_reason || "none");
+  det.append(sum, dl);
+  li.append(det);
+  return li;
+}
+
+function renderFeed(fresh) {
+  const items = feedRows.map(f => {
+    const li = mode === "it" ? itRow(f) : simpleCard(f);
+    if (fresh.has(f.id)) li.classList.add("fresh");
+    return li;
+  });
+  if (!items.length && feedCursor !== null) items.push(el("li", "muted small",
+    mode === "it" ? "No alerts match." : "Nothing that needs your attention."));
+  document.getElementById("feed").replaceChildren(...items);
+  document.getElementById("older").hidden = !feedMore;
+  renderPending();
+}
+
+function renderPending() {
+  const n = document.getElementById("new-rows");
+  n.hidden = !pending.length;
+  n.textContent = `Show ${pending.length} new`;
+}
+
+function showPending() {
+  const rows = pending;
+  pending = [];
+  addRows(rows);
+}
+
+document.getElementById("pause").addEventListener("click", e => {
+  paused = !paused;
+  e.target.textContent = paused ? "Resume" : "Pause";
+  e.target.setAttribute("aria-pressed", paused ? "true" : "false");
+  if (!paused && pending.length) showPending();
+  feedLine(paused ? "Paused" : "Live");
+});
+document.getElementById("new-rows").addEventListener("click", showPending);
+document.getElementById("older").addEventListener("click", async e => {
+  const gen = feedGen;
+  e.target.disabled = true;
+  try {
+    const d = await getFeed({ before: feedRows.length ? feedRows[feedRows.length - 1].id : feedCursor + 1 });
+    if (gen === feedGen) { feedRows = feedRows.concat(d.rows); feedMore = d.more; renderFeed(new Set()); }
+  } catch (err) { feedLine(err.message === "Failed to fetch" ? "Can't reach the Pi. Retrying..." : err.message); }
+  e.target.disabled = false;
+});
+let typing = null;
+filters.addEventListener("submit", e => e.preventDefault());
+filters.addEventListener("change", restartFeed);
+filters.elements.q.addEventListener("input", () => { clearTimeout(typing); typing = setTimeout(restartFeed, 400); });
+
+// --- IT mode: System card (Suricata, Pi and pipeline figures), every 15 s while IT mode is on.
+async function loadSystem() {
+  try {
+    const r = await fetch("/api/system", { credentials: "same-origin" });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (!r.ok) return;
+    const items = [];
+    let group = null;
+    for (const [g, k, v] of (await r.json()).rows) {
+      if (g !== group) { items.push(el("div", "sys-group", g)); group = g; }
+      items.push(el("dt", "", k), el("dd", "", v));
+    }
+    document.getElementById("system").replaceChildren(...items);
+  } catch (e) { /* shown again on the next round */ }
+}
+setInterval(() => { if (mode === "it") loadSystem(); }, 15000);
 
 // --- shared helpers
 function entryRow(addr, note, button) {

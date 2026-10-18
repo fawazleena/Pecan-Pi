@@ -77,8 +77,50 @@ button.link { background: transparent; color: var(--blue); padding: 6px 10px; }
 .feed .meta { font-size: .8rem; color: var(--muted); }
 .feed .raw { font-family: ui-monospace, monospace; font-size: .8rem; color: var(--muted); }
 
+.feed li.fresh { animation: arrive 2.5s ease-out; }
+@keyframes arrive { from { background: var(--blue-soft); } }
+@media (prefers-reduced-motion: reduce) { .feed li.fresh { animation: none; } }
+.feed-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+.feed-head h2 { margin: 0; flex: 1; }
+.small-btn { padding: 4px 12px; font-size: .8rem; background: var(--blue-soft); color: var(--blue); }
+.new-rows { width: 100%; margin-bottom: 8px; padding: 6px; font-size: .85rem; }
+#older { display: block; margin: 8px auto 0; }
+#older[hidden] { display: none; }
+
+/* IT mode feed: one dense line per alert, every stored field behind a click; scrolls inside the box */
+.filters { gap: 8px; margin-bottom: 10px; flex-wrap: wrap; }
+.filters select, .filters input { font: inherit; font-size: .85rem; padding: 6px 10px; border-radius: 10px;
+  border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
+.filters input { flex: 1 1 200px; }
+body.it .feed { max-height: 70vh; overflow-y: auto; gap: 4px; }
+.feed li.row { padding: 0; font-size: .8rem; }
+.feed .row summary { display: grid; grid-template-columns: 8.8em 5.5em 9em minmax(0, 1fr) minmax(0, 15em) 3.5em;
+  gap: 8px; padding: 6px 10px; cursor: pointer; list-style: none; align-items: baseline; }
+.feed .row summary::-webkit-details-marker { display: none; }
+.feed .row summary:focus-visible { outline: 2px solid var(--blue); outline-offset: -2px; border-radius: 10px; }
+.feed .row summary > span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.feed .row details[open] summary > span { white-space: normal; }
+.c-time, .c-det, .c-count { color: var(--muted); }
+.c-flow, .c-count { font-family: ui-monospace, monospace; }
+.c-count { text-align: right; }
+.feed .row dl { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 2px 12px; margin: 0; padding: 0 10px 10px 10px; }
+.feed .row dt, .system dt { color: var(--muted); }
+.feed .row dd, .system dd { margin: 0; overflow-wrap: anywhere; }
+@media (max-width: 800px) {
+  .feed .row summary { grid-template-columns: 1fr auto; }
+  .feed .row .c-det, .feed .row .c-flow { display: none; }
+  .feed .row .c-sig { grid-column: 1 / -1; }
+}
+
+/* IT mode System card */
+.system-box { margin-top: 24px; }
+.system { display: grid; grid-template-columns: max-content minmax(0, 1fr); gap: 3px 10px; margin: 0; font-size: .8rem; }
+.sys-group { grid-column: 1 / -1; font-weight: 600; margin-top: 8px; }
+.sys-group:first-child { margin-top: 0; }
+
 .it-only { display: none; }
 body.it .it-only { display: block; }
+body.it .filters.it-only { display: flex; }
 
 /* IP lists */
 h3 { font-size: .95rem; margin: 0 0 8px; }
@@ -87,6 +129,7 @@ h3 { font-size: .95rem; margin: 0 0 8px; }
 .iplist li { display: flex; justify-content: space-between; align-items: center; gap: 8px; overflow-wrap: anywhere;
   background: rgba(255,255,255,.6); border-radius: 10px; padding: 6px 10px; }
 .iplist li.locked { opacity: .75; }
+.iplist li > :last-child { flex: none; }
 .iplist .addr { font-family: ui-monospace, monospace; font-size: .85rem; }
 .iplist button { padding: 4px 10px; font-size: .8rem; background: var(--blue-soft); color: var(--blue); }
 .add { display: grid; gap: 6px; }
