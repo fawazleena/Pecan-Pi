@@ -8,7 +8,8 @@ no shell and no parsing: attacker bytes are only stored, truncated and made prin
 Each hit is appended as one JSON line to honeypot.json, which pipeline.py tails for AI triage.
 
 Blocks expire on their own (nftables set timeout). Stopping the service or rebooting deletes
-the table, which lifts every block.
+the table, which lifts every block. The panel's denylist (/etc/pecan/denylist.txt) is loaded into
+its own sets at startup and kept there by pecan-helper; it is only enforced while this runs.
 
     honeypot.py serve [--port 2222] [--block-seconds 600] [--dry-run]   # run by pecan-honeypot.service
     sudo honeypot.py list | unblock IP | unblock-all
@@ -16,7 +17,7 @@ the table, which lifts every block.
 import argparse, asyncio, ipaddress, json, os, subprocess, sys
 from datetime import datetime, timezone
 from pathlib import Path
-from netinfo import host_ips, gateways, iface_ips, load_settings
+from netinfo import host_ips, gateways, iface_ips, load_settings, load_ip_list
 
 PORT = 2222
 BLOCK_SECONDS = int(os.environ.get("PECAN_BLOCK_SECONDS", 3600))
@@ -26,7 +27,6 @@ READ_SECONDS = 10
 BANNER_CHARS = 128      # stored copy of what the client sent
 MAX_CONNECTIONS = 50    # beyond this, connections are still logged and blocked, but closed at once
 LOG = Path(os.environ.get("LOGS_DIRECTORY", "/var/log/pecan")) / "honeypot.json"
-ALLOWLIST = Path(__file__).with_name("allowlist.txt")
 NFT = "/usr/sbin/nft"
 TABLE = ("inet", "pecan")
 TAILSCALE_IFACE = "tailscale0"
@@ -39,10 +39,14 @@ delete table inet pecan
 table inet pecan {
   set blocked4 { type ipv4_addr; flags timeout; size 1024; }
   set blocked6 { type ipv6_addr; flags timeout; size 1024; }
+  set denied4 { type ipv4_addr; flags interval; size 256; }
+  set denied6 { type ipv6_addr; flags interval; size 256; }
   chain input {
     type filter hook input priority -10; policy accept;
     iifname != { "wlan0", "eth0" } return
     udp dport %(wg)d return
+    ip saddr @denied4 counter drop
+    ip6 saddr @denied6 counter drop
     tcp dport %(port)d ct state established return
     ip saddr @blocked4 counter drop
     ip6 saddr @blocked6 counter drop
@@ -54,14 +58,32 @@ table inet pecan {
 #   packets from unauthenticated peers, so this gives an attacker nothing.
 # tcp dport ... established: lets the decoy finish the connection that caused the block
 #   (so it can read the client banner); new connections from a blocked IP are dropped.
+# denied4/6: the panel's permanent denylist (no timeout; interval sets, so they hold CIDRs).
 
 
 def nft(*args, stdin=None):
     return subprocess.run([NFT, *args], input=stdin, capture_output=True, text=True, timeout=10)
 
 
+def denylist_elements():
+    """'add element' lines for the denylist. Overlapping entries would make nft reject the whole
+    transaction (interval sets), so they are skipped; pecan-helper refuses to write them anyway."""
+    kept = []
+    for net, _ in load_ip_list("deny"):
+        if any(net.version == k.version and net.overlaps(k) for k in kept):
+            print(f"denylist: skipping {net}, overlaps an earlier entry")
+        else:
+            kept.append(net)
+    return "".join(f"add element inet pecan denied{n.version} {{ {n} }}\n" for n in kept)
+
+
 def setup_nft(port):
-    r = nft("-f", "-", stdin=RULESET % {"wg": WIREGUARD_PORT, "port": port})
+    ruleset = RULESET % {"wg": WIREGUARD_PORT, "port": port}
+    r = nft("-f", "-", stdin=ruleset + denylist_elements())
+    if r.returncode:
+        # A broken denylist must not take automatic blocking down with it.
+        print(f"nftables setup with the denylist failed, starting without it: {r.stderr.strip()}")
+        r = nft("-f", "-", stdin=ruleset)
     if r.returncode:
         sys.exit(f"nftables setup failed: {r.stderr.strip()}")
 
@@ -78,22 +100,6 @@ def block(ip, seconds):
     return f"blocked {seconds}s" if r.returncode == 0 else f"block failed: {r.stderr.strip()}"
 
 
-def load_allowlist():
-    nets = []
-    try:
-        lines = ALLOWLIST.read_text().splitlines()
-    except FileNotFoundError:
-        return nets
-    for line in lines:
-        line = line.split("#")[0].strip()
-        if line:
-            try:
-                nets.append(ipaddress.ip_network(line, strict=False))
-            except ValueError:
-                print(f"allowlist.txt: ignoring {line!r}")
-    return nets
-
-
 def allowlisted(src, local):
     """Why src must never be blocked, or None. Re-read at every hit: hotspot IPs change."""
     ip = ipaddress.ip_address(src)
@@ -107,9 +113,10 @@ def allowlisted(src, local):
         return "the Pi itself"
     if src in gateways():
         return "default gateway"
-    for net in load_allowlist():
-        if ip in net:
-            return f"allowlist.txt {net}"
+    for name in ("protected", "allow"):   # the panel's lists, /etc/pecan/
+        for net, _ in load_ip_list(name):
+            if ip in net:
+                return f"{name} {net}"
     return None
 
 

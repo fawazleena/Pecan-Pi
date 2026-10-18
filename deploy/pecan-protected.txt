@@ -1,0 +1,4 @@
+# /etc/pecan/protected.txt: addresses that can never be blocked, not even by hand from the panel.
+# Installed by hand (no panel or pecan-helper command changes it):
+#   sudo install -o root -g root -m 0644 deploy/pecan-protected.txt /etc/pecan/protected.txt
+100.120.206.34  # admin laptop (Tailscale)

@@ -1,10 +1,10 @@
 """The Pi's current addresses, looked up at call time (hotspot IPs change), the
-reconnaissance "scan in progress" marker, and the panel's main switches.
+reconnaissance "scan in progress" marker, and the panel's main switches and IP lists.
 
 Standard library only: used by triage.py and by honeypot.py (which runs sandboxed without the
 venv), and the marker is read by anomaly.py and pipeline.py to suppress the Pi's own scans.
 """
-import json, os, subprocess, time
+import ipaddress, json, os, subprocess, time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -105,3 +105,28 @@ def load_settings():
         return out, f"{SETTINGS}: not a JSON object"
     out.update({k: data[k] for k in SWITCHES if isinstance(data.get(k), bool)})
     return out, None
+
+
+# --- IP lists (panel) -------------------------------------------------------------------------
+# Written only by pecan-helper (allowlist, denylist) or installed by hand (protected), read by
+# the honeypot (every hit, and the denylist at startup) and the panel. One entry per line,
+# "IP-or-CIDR  # optional note"; pecan-helper parses the same format (duplicated on purpose).
+IP_LISTS = {"allow": Path("/etc/pecan/allowlist.txt"), "deny": Path("/etc/pecan/denylist.txt"),
+            "protected": Path("/etc/pecan/protected.txt")}
+
+
+def load_ip_list(name):
+    """[(ip_network, note)] from one list; a missing file is an empty list, bad lines are skipped."""
+    try:
+        lines = IP_LISTS[name].read_text().splitlines()
+    except FileNotFoundError:
+        return []
+    out = []
+    for line in lines:
+        entry, _, note = line.partition("#")
+        if entry.strip():
+            try:
+                out.append((ipaddress.ip_network(entry.strip(), strict=False), note.strip()))
+            except ValueError:
+                print(f"{IP_LISTS[name]}: ignoring {entry.strip()!r}")
+    return out

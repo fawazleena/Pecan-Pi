@@ -6,10 +6,10 @@ Wants=network-online.target
 [Service]
 Type=simple
 # Standard library only, so the system Python; /home/raven is 0700, so the two source files
-# (and the optional allowlist) are bind-mounted read-only into the sandbox instead.
+# are bind-mounted read-only into the sandbox instead. Settings and IP lists are read from
+# /etc/pecan (0644, readable under ProtectSystem=strict).
 BindReadOnlyPaths=/home/raven/pecan-pi/honeypot.py:/opt/pecan/honeypot.py
 BindReadOnlyPaths=/home/raven/pecan-pi/netinfo.py:/opt/pecan/netinfo.py
-BindReadOnlyPaths=-/home/raven/pecan-pi/allowlist.txt:/opt/pecan/allowlist.txt
 ExecStart=/usr/bin/python3 /opt/pecan/honeypot.py serve
 # Stopping the service lifts every block ('-': no error if the table is already gone).
 ExecStopPost=-/usr/sbin/nft delete table inet pecan

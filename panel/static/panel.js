@@ -106,6 +106,108 @@ async function refresh() {
   }
 }
 
+// --- IP lists: loaded on page load and after each change (current blocks need a root helper
+// call, which is journaled, so they are not part of the 5 s poll).
+function listMsg(text, ok) {
+  const m = document.getElementById("lists-msg");
+  m.textContent = text;
+  m.className = "small " + (ok ? "ok" : "error");
+}
+
+function entryRow(addr, note, button) {
+  const li = el("li");
+  const label = el("span");
+  label.append(el("span", "addr", addr));
+  if (note) label.append(" ", el("span", "muted small", note));
+  li.append(label);
+  if (button) li.append(button);
+  return li;
+}
+
+function actionButton(text, onClick) {
+  const b = el("button", "", text);
+  b.type = "button";
+  b.addEventListener("click", onClick);
+  return b;
+}
+
+function minutes(sec) {
+  if (sec === null || sec === undefined) return "";
+  const m = Math.ceil(sec / 60);
+  return `${m} min left`;
+}
+
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST", credentials: "same-origin",
+    headers: { "Content-Type": "application/json",
+               "X-CSRFToken": document.querySelector('meta[name="csrf-token"]').content },
+    body: JSON.stringify(body) });
+  if (r.status === 401) { location.href = "/login"; throw new Error("signed out"); }
+  const data = await r.json().catch(() => ({}));
+  if (!r.ok) throw new Error(data.error || "The Pi refused the change.");
+  return data;
+}
+
+async function change(list, action, net, note) {
+  try {
+    const d = await post("/api/lists", { list, action, net, note });
+    listMsg(`Done${d.applied ? ": " + d.applied : ""}.`, true);
+    return true;
+  } catch (e) {
+    listMsg(e.message === "Failed to fetch" ? "Can't reach the Pi. Nothing was changed." : e.message, false);
+    return false;
+  } finally {
+    loadLists();
+  }
+}
+
+function renderLists(d) {
+  const locked = d.protected.map(p => {
+    const li = entryRow(p.net, p.note, el("span", "muted small", "locked"));
+    li.classList.add("locked");
+    return li;
+  });
+  document.getElementById("list-protected").replaceChildren(...locked);
+  document.getElementById("list-allow").replaceChildren(...d.allow.map(e => entryRow(e.net, e.note,
+    actionButton("Remove", () => confirm(`Stop trusting ${e.net}?`) && change("allow", "remove", e.net)))));
+  const deny = d.deny.map(e => entryRow(e.net, e.note,
+    actionButton("Unblock", () => confirm(`Unblock ${e.net}?`) && change("deny", "remove", e.net))));
+  if (!deny.length) deny.push(el("li", "muted small", "Nothing blocked."));
+  document.getElementById("list-deny").replaceChildren(...deny);
+  let blocks;
+  if (d.blocks_error) blocks = [el("li", "muted small", d.blocks_error)];
+  else if (d.enforced === false) blocks = [el("li", "muted small",
+    "The trap door service is stopped: nothing is being blocked right now, including the list on the left.")];
+  else blocks = d.blocks.map(b => entryRow(b.ip, minutes(b.expires), actionButton("Unblock", async () => {
+    if (!confirm(`Lift the block on ${b.ip} now?`)) return;
+    try { await post("/api/unblock", { ip: b.ip }); listMsg(`${b.ip} unblocked.`, true); }
+    catch (e) { listMsg(e.message, false); }
+    loadLists();
+  })));
+  if (!blocks.length) blocks.push(el("li", "muted small", "Nobody right now."));
+  document.getElementById("list-blocks").replaceChildren(...blocks);
+}
+
+async function loadLists() {
+  try {
+    const r = await fetch("/api/lists", { credentials: "same-origin" });
+    if (r.status === 401) { location.href = "/login"; return; }
+    if (r.ok) renderLists(await r.json());
+  } catch (e) {
+    listMsg("Can't reach the Pi. Retrying when you press Refresh.", false);
+  }
+}
+
+document.querySelectorAll("form.add").forEach(f => f.addEventListener("submit", async e => {
+  e.preventDefault();
+  const net = f.net.value.trim(), note = f.note.value.trim();
+  if (f.dataset.list === "deny" && !confirm(`Block ${net} from reaching the Pi until you unblock it?`)) return;
+  if (await change(f.dataset.list, "add", net, note)) f.reset();
+}));
+document.getElementById("lists-refresh").addEventListener("click", () => { listMsg("", true); loadLists(); });
+loadLists();
+
 document.getElementById("switches").addEventListener("click", e => {
   const row = e.target.closest(".switch-row");
   if (row && !row.disabled && !busy) toggle(row);

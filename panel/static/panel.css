@@ -79,3 +79,16 @@ button.link { background: transparent; color: var(--blue); padding: 6px 10px; }
 
 .it-only { display: none; }
 body.it .it-only { display: block; }
+
+/* IP lists */
+h3 { font-size: .95rem; margin: 0 0 8px; }
+.lists { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 20px; }
+.iplist { list-style: none; padding: 0; margin: 0 0 8px; display: grid; gap: 6px; }
+.iplist li { display: flex; justify-content: space-between; align-items: center; gap: 8px; overflow-wrap: anywhere;
+  background: rgba(255,255,255,.6); border-radius: 10px; padding: 6px 10px; }
+.iplist li.locked { opacity: .75; }
+.iplist .addr { font-family: ui-monospace, monospace; font-size: .85rem; }
+.iplist button { padding: 4px 10px; font-size: .8rem; background: var(--blue-soft); color: var(--blue); }
+.add { display: grid; gap: 6px; }
+.add input { font: inherit; padding: 8px 10px; border-radius: 10px; border: 1px solid #b9cdef; background: rgba(255,255,255,.8); min-width: 0; }
+#lists-msg.error { color: var(--red); } #lists-msg.ok { color: var(--green); }

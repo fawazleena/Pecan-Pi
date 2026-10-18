@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, session, url_for
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
-from netinfo import iface_ips, load_settings
+from netinfo import iface_ips, load_settings, load_ip_list
 
 HERE = Path(__file__).parent
 ENV = HERE / ".env"
@@ -45,6 +45,7 @@ OFF_NOTES = {"signatures": "Off: alerts for known attacks are ignored. The netwo
              "auto_block": "Off: visits to the trap door are recorded, but nobody is blocked. Existing blocks run out on their own.",
              "ai": "Off: alerts are stored without an explanation and nothing is sent to the AI service."}
 CACHE_PREFIXES = ("[cached] ", "[backfill] ", "[retriage] ")
+EDITABLE_LISTS = ("allow", "deny")   # protected.txt is installed by hand and shown locked
 
 load_dotenv(ENV)
 app = Flask(__name__, template_folder="panel/templates", static_folder="panel/static")
@@ -275,7 +276,7 @@ def helper(*args):
         r = subprocess.run(["sudo", "-n", HELPER, *args], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired) as err:
         return False, str(err)
-    return r.returncode == 0, (r.stderr or r.stdout).strip()
+    return r.returncode == 0, (r.stdout if r.returncode == 0 else r.stderr or r.stdout).strip()
 
 
 @app.post("/api/switch")
@@ -291,6 +292,59 @@ def api_switch():
     if not ok:
         return jsonify(error=f"The Pi couldn't change this setting ({msg[:200]})."), 500
     return jsonify(switches=switches()[0])
+
+
+# --- IP lists -------------------------------------------------------------------------------
+def entries(name):
+    # Single addresses without /32 or /128, as pecan-helper writes them.
+    return [{"net": str(n.network_address) if n.prefixlen == n.max_prefixlen else str(n), "note": note}
+            for n, note in load_ip_list(name)]
+
+
+@app.get("/api/lists")
+def api_lists():
+    """The three lists (files are world-readable) and the honeypot's current timed blocks (root:
+    asked from the helper, so only on page load and after a change, never in the 5 s poll)."""
+    ok, out = helper("list-blocks")
+    try:
+        blocks = json.loads(out) if ok else None
+    except ValueError:
+        blocks = None
+    return jsonify(allow=entries("allow"), deny=entries("deny"), protected=entries("protected"),
+                   blocks=blocks["blocks"] if blocks else [], enforced=blocks["enforced"] if blocks else None,
+                   blocks_error=None if blocks else f"Couldn't ask the Pi for current blocks ({out[:200]}).")
+
+
+@app.post("/api/lists")
+def api_lists_change():
+    body = request.get_json(silent=True) or {}
+    name, action, net, note = body.get("list"), body.get("action"), body.get("net"), body.get("note", "")
+    # Only fixed words and short strings reach argv; pecan-helper validates the address and note again.
+    if (name not in EDITABLE_LISTS or action not in ("add", "remove") or not isinstance(net, str)
+            or not isinstance(note, str) or not net.strip() or len(net) > 64 or len(note) > 64):
+        abort(400)
+    args = [f"list-{action}", name, net.strip()] + ([note.strip()] if action == "add" and note.strip() else [])
+    ok, msg = helper(*args)
+    print(f"list {action} {name} {net.strip()!r} from {request.remote_addr}: {'ok' if ok else msg}")
+    if not ok:
+        return jsonify(error=msg[:300] or "The Pi couldn't change the list."), 400
+    try:
+        applied = json.loads(msg).get("applied", "")
+    except ValueError:
+        applied = ""
+    return jsonify(ok=True, applied=applied)
+
+
+@app.post("/api/unblock")
+def api_unblock():
+    ip = (request.get_json(silent=True) or {}).get("ip")
+    if not isinstance(ip, str) or not ip or len(ip) > 64:
+        abort(400)
+    ok, msg = helper("unblock", ip)
+    print(f"unblock {ip!r} from {request.remote_addr}: {'ok' if ok else msg}")
+    if not ok:
+        return jsonify(error=msg[:300] or "The Pi couldn't lift this block."), 400
+    return jsonify(ok=True)
 
 
 # --- setup commands ---------------------------------------------------------------------------

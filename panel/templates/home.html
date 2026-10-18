@@ -46,6 +46,38 @@
       <p id="hidden" class="muted small"></p>
       <p id="updated" class="muted small"></p>
     </section>
+    <section class="glass" id="lists">
+      <h2>Trusted and blocked</h2>
+      <p id="lists-msg" class="small" role="alert"></p>
+      <div class="lists">
+        <div>
+          <h3>Trusted <span class="muted small">never blocked automatically</span></h3>
+          <ul id="list-protected" class="iplist"></ul>
+          <ul id="list-allow" class="iplist"></ul>
+          <form class="add" data-list="allow">
+            <input name="net" placeholder="IP address or range" maxlength="64" required aria-label="Address to trust">
+            <input name="note" placeholder="Name (optional)" maxlength="40" aria-label="Name">
+            <button type="submit">Trust</button>
+          </form>
+        </div>
+        <div>
+          <h3>Always blocked <span class="muted small">cut off from the Pi</span></h3>
+          <ul id="list-deny" class="iplist"></ul>
+          <form class="add" data-list="deny">
+            <input name="net" placeholder="IP address or range" maxlength="64" required aria-label="Address to block">
+            <input name="note" placeholder="Name (optional)" maxlength="40" aria-label="Name">
+            <button type="submit">Block</button>
+          </form>
+        </div>
+        <div>
+          <h3>Blocked for a while <span class="muted small">touched the trap door</span></h3>
+          <ul id="list-blocks" class="iplist"></ul>
+          <button type="button" class="link" id="lists-refresh">Refresh</button>
+        </div>
+      </div>
+      <p class="muted small it-only">Trusted: max /16 (IPv6 /48). Always blocked: max /24 (IPv6 /64), only on wlan0/eth0;
+        Tailscale is never filtered. Files: /etc/pecan/allowlist.txt, denylist.txt, protected.txt (pecan-helper).</p>
+    </section>
   </main>
 </div>
 <script src="{{ url_for('static', filename='panel.js') }}"></script>
