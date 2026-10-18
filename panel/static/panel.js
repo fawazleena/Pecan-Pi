@@ -75,7 +75,8 @@ function render(s) {
   document.getElementById("drops").textContent = s.kernel_drops;
   renderSwitches(s.switches);
   document.getElementById("settings-error").textContent = s.settings_error || "";
-  // Simple mode leaves out rows the AI judged normal or hasn't explained, and says how many of
+  // Simple mode leaves out rows the AI judged normal or hasn't explained (unless the firewall
+  // blocked someone: those always show), and says how many of
   // each; IT mode shows everything.
   const simple = mode === "simple";
   const n = s.hidden_last_hour, u = s.unexplained_last_hour;
