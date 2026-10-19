@@ -51,6 +51,7 @@ tool for checking other machines for known vulnerabilities.
 | Part | What is actually used |
 |---|---|
 | Hardware | Raspberry Pi 4, **8 GB RAM**, 4 CPU cores, microSD storage, no real-time clock. Headless (no screen), managed over SSH. The Pi belongs to a groupmate. |
+| Power | **Use the official Raspberry Pi 5.1 V 3 A USB-C supply.** A weaker supply hard-reset the Pi once under full load (Section 5.9, live verification). |
 | Network | Phone hotspot (the Pi's IP address changes between hotspots). Both Wi-Fi and Ethernet are monitored. |
 | Operating system | **Kali Linux** (Kali GNU/Linux Rolling, `VERSION_ID=2026.3`) |
 | Network IDS | **Suricata 8.0.7**, ET Open rule set plus one local test rule |
@@ -434,7 +435,36 @@ honeypot blocks, Suricata rule groups and their own simple rules.
   Own rules: ~0.3 s test, then reload.
 - Live-verified on the Pi: IP lists and timed blocks (phase 3), a rule-group change (Games
   53053 -> 53030 -> 53053 rules), own rule add/edit/on-off, live feed, filters, search, details,
-  System card (phase 5). The phase-6 systemd unit: see the checks in `CLAUDE.md`.
+  System card (phase 5).
+- **Phase 6 live verification (2026-10-19, after a reboot):** all four services (`suricata`,
+  `pecan-pipeline`, `pecan-honeypot`, `pecan-panel`) active under systemd; the root-run services use
+  the root-owned code in `/opt/pecan`; switching the Games group off and on again from the systemd
+  panel works, so the sandbox's writable paths are correct.
+
+**Incidents during the live checks (2026-10-19).**
+- **Power: hard reset in the middle of a rule change.** At 03:21 the Pi reset itself while switching
+  the Games group back on. The journal simply stops (no shutdown messages), which points to power
+  loss rather than a software crash. A rule-group change is the heaviest thing the Pi does: the
+  rebuild and the full `suricata -T` use all four cores, on top of the running Suricata. After
+  swapping to a better power supply, two rule-group changes in a row ran cleanly and
+  `vcgencmd get_throttled` reported `0x0` (no under-voltage or throttling since boot). Likely cause:
+  the old supply could not hold the voltage under full 4-core load (not proven, but consistent with
+  the evidence). **Deployment note: use the official Raspberry Pi 5.1 V 3 A USB-C supply.**
+- **The rollback design held through the crash.** After the reboot the rules were consistent: no
+  `GAMES` line in `disable.conf` and 53,053 rules loaded, i.e. the state before the interrupted
+  change. A power cut is a harsher test than the planned failures (a failed test or reload), and no
+  half-written rule set was left behind.
+- **Slow boot: ~2 min 40 s.** `systemd-networkd-wait-online` waited for its timeout because
+  `systemd-networkd` manages no interfaces on this Pi (NetworkManager runs the network), so
+  "network online" was never reported. Masking it brought boot down to **39 s**. Install step:
+  `sudo systemctl mask systemd-networkd-wait-online.service`.
+
+**Not yet tested live.**
+- The panel over `wlan0` (the hotspot LAN): deferred until the baseline-2 snapshot is taken, so no
+  test traffic lands in the baseline. So far it has only been used over Tailscale.
+- Recovery after a `tailscaled` restart (the panel should stop with `tailscale0` and start again
+  with it).
+- That the panel is unreachable over `eth0` (no cable plugged in yet).
 
 **Known limitations / trade-offs.**
 - **Login lockout is in memory:** a panel restart clears it (and the rule-job list). An attacker who
@@ -443,7 +473,8 @@ honeypot blocks, Suricata rule groups and their own simple rules.
   The trade-off is accepted because sudo only allows the one helper, which validates every argument.
   The honeypot service keeps `NoNewPrivileges=yes`.
 - **While Tailscale is down, the panel is down** (also on the LAN), a consequence of binding to the
-  `tailscale0` device. `eth0` has never been tested live (no cable plugged in).
+  `tailscale0` device. The recovery after a `tailscaled` restart and the `eth0` block have not been
+  tested live yet (see above).
 - Self-signed certificate: a browser warning, and the certificate's IP list goes stale when the
   hotspot IP changes (re-run `make-cert`).
 - One admin account, no roles, no audit log in the panel itself (the helper's journal log is the audit
