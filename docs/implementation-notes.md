@@ -28,7 +28,7 @@ Written for groupmates who did not see the build. Technical terms are explained 
 
 ### PENDING
 
-1. **Uni lab baseline + live anomaly model.** A new "normal traffic" baseline is collected on the university network starting **Sunday 2026-10-18**. Then: train, evaluate, switch live scoring on, and run the live tests (Section 5.6, "Step 5 checklist" in `CLAUDE.md`).
+1. **Baseline 2 + live anomaly model.** A new "normal traffic" baseline of the Pi's own traffic on the phone hotspot it always runs on (`wlan0`; also when the Pi is physically at the university, it is never on the university network). Collection started **Sunday 2026-10-18**. The hotspot's subnet changes when it restarts (192.168.221.x, then 192.168.81.x). Then: train, evaluate, switch live scoring on, and run the live tests (Section 5.6, "Step 5 checklist" in `CLAUDE.md`).
 2. **Cisco SPAN lab.** Not built yet. Nothing about it is in the repository, so it is not described here beyond being pending.
 3. **Demo run.** Not done yet. Click order for a 5-minute video: Section 5.10.
 
@@ -291,7 +291,7 @@ CIC-IDS2017 results: Section 6.2.
 - Partly synthetic baseline.
 - Isolation Forest cannot rank points far outside the training range as stranger than the most extreme normal flow; a 0.5% threshold caught nothing.
 - Tailscale relay traffic from the Pi is invisible to this detector (could hide exfiltration over that channel).
-- **Live scoring is off until the uni baseline (PENDING).**
+- **Live scoring is off until baseline 2 (phone hotspot, PENDING).**
 
 ### 5.7 Honeypot + automated prevention
 
@@ -526,7 +526,7 @@ of the Pi's ordinary traffic:
 - With the exclusion and a retrained model: **107 of 174** flagged (**61%**), 00:10-00:19 local, steady over time. All HTTPS flows (25/25) and most Tailscale port-mapper probes (32/43) were flagged.
 - Cause: on the new network a normal minute touched a median of 7 ports / 5 hosts with 23% unanswered; in baseline 1 the median was 1 port / 2 hosts with 100% unanswered, and 95% of minutes touched 3 ports or fewer.
 - The held-out false-positive rate on baseline 1 stayed 2.0% throughout: the 2% budget only holds on the network the baseline describes.
-- Response: not more allowlisting (that hides symptoms and widens blind spots) but a new baseline on the network where the detector is used (uni, PENDING), and retraining whenever the network changes.
+- Response: not more allowlisting (that hides symptoms and widens blind spots) but a new baseline on the network where the detector is used (baseline 2: the Pi's own phone hotspot, PENDING), and retraining whenever the network changes.
 - Caveat: small sample (one 9-minute window right after a boot).
 
 ### 6.2 CIC-IDS2017 evaluation
@@ -663,12 +663,12 @@ thresholds (commit 3bf52c9).
 
 | Thesis section | What to update |
 |---|---|
-| 3.1 Modules | Add Honeypot + prevention and Recon/VAPT as built modules; describe the eight modules in Section 5. State "IDPS", not only IDS. Mark anomaly detection as built and evaluated but live scoring pending the uni baseline. |
+| 3.1 Modules | Add Honeypot + prevention and Recon/VAPT as built modules; describe the eight modules in Section 5. State "IDPS", not only IDS. Mark anomaly detection as built and evaluated but live scoring pending baseline 2. |
 | 3.2 Tech Stack | Replace with the table in Section 3 (Kali, Groq gpt-oss-120b, 8 GB, Suricata 8.0.7, Tailscale, SQLite, Textual, WeasyPrint, scikit-learn, nftables, nmap/searchsploit). |
 | Design diagrams (ERD, DFD, UML) | Redraw (Section 8). |
 | 3.x Interface | Two interfaces: the Textual TUI (analyst, SSH) and the web control panel (owner + IT mode, Section 5.9). Security design: one root helper, sudoers line, interface restriction, root-owned code in `/opt/pecan`. |
 | **New: Implementation chapter** | Architecture (Section 4), per-module "how it works" and "design decisions" (Section 5), deployment (systemd services, log rotation fix), security hardening of the honeypot service. |
-| **New: Results / Evaluation chapter** | Section 6: baseline 1 and replay results, domain shift, CIC-IDS2017 tables, honeypot and recon live tests, verdict-consistency fix, backfill numbers, performance fix. Leave placeholders for uni baseline, live tests, Cisco SPAN lab, demo. |
+| **New: Results / Evaluation chapter** | Section 6: baseline 1 and replay results, domain shift, CIC-IDS2017 tables, honeypot and recon live tests, verdict-consistency fix, backfill numbers, performance fix. Leave placeholders for baseline 2, live tests, Cisco SPAN lab, demo. |
 | **New: Limitations / Discussion** | Every "Known limitations" list in Section 5; HOME_NET effect; partly synthetic baseline; Tailscale blind spots. |
 | Ethics section | Section 9. |
 | Future work | NVD cache for recon, `default_creds` check, retraining per network, better handling of slow/beaconing threats (botnet), paid AI tier or local model for analyst load. |
@@ -827,5 +827,5 @@ so "outside -> inside" rules don't fire. With HOME_NET set to the victim LAN, th
 at 0 s.
 
 **Q7. Is the anomaly detector working live?**
-Not yet. It was switched off after the domain-shift finding and will be retrained on a new baseline from
-the university network (starting 2026-10-18).
+Not yet. It was switched off after the domain-shift finding and will be retrained on a new baseline of the Pi's own
+traffic on the phone hotspot it runs on (baseline 2, starting 2026-10-18).

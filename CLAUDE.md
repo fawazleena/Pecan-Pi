@@ -159,7 +159,7 @@ PDF for a time range (`--since`/`--until`, local time, compared against `seen_at
 
 ## Anomaly detection (`anomaly.py`; DISABLED pending baseline 2)
 
-**Status (2026-10-16):** live scoring is **off**. The baseline-1 model was renamed to `anomaly_model.friend.joblib`, so `pipeline.py` logs `anomaly detection off: no /opt/pecan/anomaly_model.joblib`; signatures + AI triage run as normal. Reason: domain shift (below), which also spent a Groq request almost every 30 s batch (anomalies are never cached). **Baseline 2 is collected on the uni network starting Sunday 2026-10-18**, then the step 5 checklist runs again on it.
+**Status (2026-10-16):** live scoring is **off**. The baseline-1 model was renamed to `anomaly_model.friend.joblib`, so `pipeline.py` logs `anomaly detection off: no /opt/pecan/anomaly_model.joblib`; signatures + AI triage run as normal. Reason: domain shift (below), which also spent a Groq request almost every 30 s batch (anomalies are never cached). **Baseline 2 = the Pi's own traffic on the phone hotspot (wlan0), not the uni network.** The Pi has always been on the user's phone hotspot, even when physically at uni; the hotspot's subnet changes when it restarts (192.168.221.x on 2026-10-18, 192.168.81.x from 2026-10-18 evening). Baseline 1 was a friend's hotspot, so baseline 2 is the network the detector actually runs on. Then the step 5 checklist runs again on it.
 
 Isolation Forest on Suricata `flow` events, as a second detector next to signatures. Phases: collect baseline -> `snapshot` -> train -> live scoring inside `pipeline.py`. Broadcast/multicast destinations are excluded in both training and scoring (`is_broadcast_or_multicast`), since that chatter depends on which network the Pi is on.
 
@@ -219,7 +219,7 @@ nice -n 19 .venv/bin/python cic_eval.py metrics # ablation -> cic/metrics.txt + 
 
 ### Step 5 checklist (after collection; rerun for baseline 2)
 
-For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out baseline_uni.jsonl` (then `--baseline baseline_uni.jsonl`) so baseline 1 stays for the thesis. Snapshot within ~a week of the start (logrotate keeps 14 files, rotating daily or at 100 MB). After freezing, delete its broadcast/multicast flows as was done for baseline 1, run `anomaly.py derp-refresh` before training, and use the uni-network Pi/laptop IPs for `make_replay.py`. No scans or tests on the Pi during collection.
+For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out baseline_hotspot2.jsonl` (then `--baseline baseline_hotspot2.jsonl`) so baseline 1 stays for the thesis. Snapshot within ~a week of the start (logrotate keeps 14 files, rotating daily or at 100 MB). After freezing, delete its broadcast/multicast flows as was done for baseline 1, run `anomaly.py derp-refresh` before training, and use the Pi/laptop IPs on the current hotspot subnet for `make_replay.py`. No scans or tests on the Pi during collection.
 
 
 1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
