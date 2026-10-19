@@ -1,0 +1,37 @@
+[Unit]
+Description=Pecan Pi control panel (HTTPS on Tailscale and wlan0, never eth0)
+# RestrictNetworkInterfaces= is resolved to interface numbers when the service starts, and
+# tailscaled creates tailscale0 anew (new number) each time it starts. Binding to the device stops
+# the panel when tailscale0 goes away and starts it again (WantedBy below) when it comes back.
+# Trade-off: while Tailscale is down, the panel is down on the LAN too.
+BindsTo=sys-subsystem-net-devices-tailscale0.device
+After=sys-subsystem-net-devices-tailscale0.device network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=raven
+Group=raven
+WorkingDirectory=/home/raven/pecan-pi
+# 0.0.0.0, not fixed IPs: hotspot IPs change. Which interfaces may reach it is decided below.
+ExecStart=/home/raven/pecan-pi/.venv/bin/python panel.py serve --host 0.0.0.0
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1
+# Only loopback, the LAN Wi-Fi and Tailscale. Never eth0: it may become a SPAN/mirror port.
+RestrictNetworkInterfaces=lo wlan0 tailscale0
+ProtectSystem=strict
+ProtectHome=read-only
+PrivateTmp=yes
+# The sandbox also applies to pecan-helper, which sudo starts inside this unit: these are the
+# paths the helper (root) writes. The panel itself (raven) has no write permission on any of them.
+ReadWritePaths=/etc/pecan /etc/suricata /var/lib/suricata -/run/sudo -/run/suricata
+# NoNewPrivileges= stays off (default): it would stop sudo, i.e. every change made in the panel.
+# No CPUQuota/MemoryMax: the helper's `suricata -T` (~1.4 GB, nice 19) runs in this cgroup.
+Nice=10
+# A restart must not kill a running rule change: the helper runs in its own session and finishes
+# (or rolls back) on its own; only the gunicorn master gets the stop signal.
+KillMode=process
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target sys-subsystem-net-devices-tailscale0.device

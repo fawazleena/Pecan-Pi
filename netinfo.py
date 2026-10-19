@@ -32,10 +32,15 @@ def iface_ips(name):
     return [a.split("/")[0] for a in fields[2:]]
 
 
+# Data files (pecan.db, .env, recon_active.json) live next to the code in the repo. The root-run
+# services run root-owned copies of the code from /opt/pecan and set PECAN_DATA to the repo.
+DATA = Path(os.environ.get("PECAN_DATA") or Path(__file__).parent)
+
+
 # --- Reconnaissance scan marker ---------------------------------------------------------------
 # recon.py writes this while it is scanning so the Pi's own detectors don't flag the scan.
 # It is a plain file, not a lock: both detectors only read it, and it is advisory.
-RECON_MARKER = Path(__file__).with_name("recon_active.json")
+RECON_MARKER = DATA / "recon_active.json"
 RECON_MAX_AGE = 3600   # seconds; a marker older than this is ignored (safety net against a leak)
 RECON_TAIL = 120       # seconds kept active after a scan ends, to cover late flow records
 

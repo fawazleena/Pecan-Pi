@@ -5,11 +5,9 @@ Wants=network-online.target
 
 [Service]
 Type=simple
-# Standard library only, so the system Python; /home/raven is 0700, so the two source files
-# are bind-mounted read-only into the sandbox instead. Settings and IP lists are read from
+# Standard library only, so the system Python. Root-owned copies in /opt/pecan
+# (deploy/install-code.sh), not the user-writable repo. Settings and IP lists are read from
 # /etc/pecan (0644, readable under ProtectSystem=strict).
-BindReadOnlyPaths=/home/raven/pecan-pi/honeypot.py:/opt/pecan/honeypot.py
-BindReadOnlyPaths=/home/raven/pecan-pi/netinfo.py:/opt/pecan/netinfo.py
 ExecStart=/usr/bin/python3 /opt/pecan/honeypot.py serve
 # Stopping the service lifts every block ('-': no error if the table is already gone).
 ExecStopPost=-/usr/sbin/nft delete table inet pecan
@@ -21,7 +19,7 @@ AmbientCapabilities=CAP_NET_ADMIN
 CapabilityBoundingSet=CAP_NET_ADMIN
 NoNewPrivileges=yes
 ProtectSystem=strict
-ProtectHome=read-only
+ProtectHome=yes
 PrivateTmp=yes
 LogsDirectory=pecan
 # Never take CPU from Suricata, even under a connection flood.

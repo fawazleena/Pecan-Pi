@@ -24,12 +24,13 @@ Written for groupmates who did not see the build. Technical terms are explained 
 - **Reconnaissance / VAPT**: analyst-started, non-destructive nmap scan, offline CVE matching, and an approve/decline gate for each finding. Live test against our own laptop passed 2026-10-16 (Section 5.8).
 - **CIC-IDS2017 evaluation** of both detectors (signatures and anomaly), plus a performance fix it uncovered.
 - **Log rotation fix** so Suricata's log cannot fill the SD card.
+- **Control panel (web)**, added 2026-10-19: HTTPS page for the owner (Simple mode) and analyst (IT mode); switches, IP lists, rule groups and own rules, live feed. Root-run code moved to root-owned copies in `/opt/pecan` (Section 5.9).
 
 ### PENDING
 
 1. **Uni lab baseline + live anomaly model.** A new "normal traffic" baseline is collected on the university network starting **Sunday 2026-10-18**. Then: train, evaluate, switch live scoring on, and run the live tests (Section 5.6, "Step 5 checklist" in `CLAUDE.md`).
 2. **Cisco SPAN lab.** Not built yet. Nothing about it is in the repository, so it is not described here beyond being pending.
-3. **Demo run.** Not done yet.
+3. **Demo run.** Not done yet. Click order for a 5-minute video: Section 5.10.
 
 ---
 
@@ -57,6 +58,7 @@ tool for checking other machines for known vulnerabilities.
 | Remote access | **Tailscale** 1.102.4 (VPN used to reach the Pi) |
 | Database | **SQLite** 3.53.4 (`pecan.db`) |
 | Dashboard | **Textual** 8.2.8 (terminal user interface, Python) |
+| Control panel | **Flask** 3.1.3 + Flask-WTF, served by **gunicorn** (Kali package `python3-gunicorn`) over HTTPS (added 2026-10-19) |
 | PDF reports | **WeasyPrint** 69.0 + Jinja2 templates |
 | Anomaly detection | **scikit-learn** 1.9.1 `IsolationForest` |
 | Firewall (prevention) | **nftables** (Linux kernel firewall) |
@@ -96,6 +98,8 @@ Software versions above were read off the Pi on the snapshot date.
                      |         |
                      v         v
                   tui.py    report.py --> PDF (Groq writes prose only; numbers from SQL)
+                     |
+                  panel.py (web, HTTPS) --sudo--> pecan-helper (root) --> /etc/pecan, nftables, Suricata rules
 ```
 
 In words:
@@ -104,7 +108,7 @@ In words:
 2. **The honeypot** listens on port 2222. Anyone who connects is blocked immediately by the firewall, and the hit is written to `/var/log/pecan/honeypot.json`.
 3. **The pipeline** (`pipeline.py`) follows both log files. Every 30 seconds it groups what arrived, optionally scores flows with the anomaly model, and sends the groups to the AI for a verdict (`triage.py`).
 4. Results go into **SQLite** (`pecan.db`).
-5. The **TUI** (`tui.py`) and the **PDF report** (`report.py`) read the database (read-only).
+5. The **TUI** (`tui.py`), the **PDF report** (`report.py`) and the **web control panel** (`panel.py`) read the database (read-only). The panel's changes (switches, IP lists, rules) go through the root-owned `pecan-helper`.
 6. **Recon** (`recon.py`) is separate: the analyst runs it by hand against a named target. Its findings are stored in the same database and, once approved and verified, triaged by the same AI.
 
 ---
@@ -352,6 +356,131 @@ Not yet tested live: a target where Exploit-DB *does* match a CVE, the `version_
 - Self-recon exclusion is a blind spot while a scan runs.
 - Must not be run on the Pi during baseline-2 collection.
 
+### 5.9 Control panel (web, `panel.py`)
+
+*Added 2026-10-19 (built in six phases, 2026-10-18 to 10-19; the rest of this document is the 10-16 snapshot).*
+
+**What it does.** A small HTTPS web page for a non-technical owner, with an "IT mode" for the
+analyst. It shows whether the Pi is healthy, what has happened (live feed), and lets the owner change
+a few things without a terminal: four main switches, trusted / always-blocked IP lists, current
+honeypot blocks, Suricata rule groups and their own simple rules.
+
+**How it works.**
+- **Flask app, served by gunicorn** (`pecan-panel.service`, port 8443, HTTPS with a self-signed
+  certificate from `panel.py make-cert`; the browser shows a warning once, and the SHA-256 fingerprint
+  printed by `make-cert` is compared with it). One worker process with 8 threads: the login lockout,
+  the `kernel_drops` trend and rule-change jobs live in that process's memory.
+- **Runs as the normal user** (`raven`), reads `pecan.db` read-only. Every change that needs root goes
+  through **`pecan-helper`**: a root-owned copy in `/usr/local/sbin`, standard library only, a fixed
+  list of subcommands, arguments passed as a list (never a shell), every call logged to the journal
+  (`journalctl -t pecan-helper`). One `sudoers` line allows exactly that program without a password.
+- **Login:** one admin password (scrypt hash in `.env`), session cookie `Secure`/`HttpOnly`/
+  `SameSite=Strict`, logged out after 30 min without a page load or change (background polling doesn't
+  count), CSRF token on every change, strict Content-Security-Policy (no inline scripts, nothing from
+  other sites). 5 wrong passwords per client IP in 15 min locks that IP out for the rest of the window.
+- **Simple mode** (default): a big status ("All good" / something to look at), service dots, switches,
+  a feed in plain words ("Someone tried the trap door", "Worth a look") that hides normal and
+  not-yet-explained rows behind one count line; rows where the firewall acted are always shown.
+  **IT mode**: dense expandable rows with every stored field, filters (detection, verdict, search on
+  signature/IP/SID/reason), a System card (Suricata uptime, packets, `kernel_drops`, memory; the Pi's load, temperature,
+  memory and disk; alert rows and Groq rate-limit headers from the pipeline's log) and raw rule text. The feed polls `/api/feed` every 2 s
+  (chosen over server-sent events so the idle-logout check keeps working and no thread is held per
+  browser).
+- **Main switches** (`/etc/pecan/settings.json`): watch for known attacks, spot unusual behaviour,
+  block intruders automatically, explain alerts with AI. The pipeline and honeypot re-read them every
+  batch / hit, so no restart is needed.
+- **IP lists** (`/etc/pecan/allowlist.txt`, `denylist.txt`, `protected.txt`): trusted (never
+  auto-blocked, max /16), always blocked (nftables interval sets, max /24), and protected (the admin
+  laptop's Tailscale IP, installed by hand, shown locked). The helper refuses a block that would cut
+  off the admin, the Pi itself or its gateway.
+- **Rules:** seven noisy/policy rule groups can be switched off (info, hunting, adware, tor, p2p, chat,
+  games; malware/exploit/attack/scan groups never). A change rebuilds from the cached rule download
+  (`suricata-update --offline`), checks that no Pecan SID went missing, tests the whole configuration
+  (`suricata -T`, ~30 s) and only then reloads Suricata live; any failure restores the previous files and
+  the running Suricata keeps its rules. Own rules are a structured form (protocol, from, to, port,
+  name, optional text), never free rule text, each tested alone before reload. Rule changes run as
+  background jobs with live steps (rebuilding / testing / reloading).
+- **Deployment hardening (phase 6):**
+  - The panel unit listens on `0.0.0.0` but `RestrictNetworkInterfaces=lo wlan0 tailscale0`: the
+    kernel (a systemd BPF filter) drops its traffic on any other interface, so **never `eth0`** (planned
+    SPAN/mirror port), decided by interface rather than by IP because hotspot IPs change. systemd
+    resolves interface names when the service starts and `tailscale0` is recreated when Tailscale
+    restarts, so the unit is bound to the `tailscale0` device: stopped when it disappears, started
+    again when it returns.
+  - `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`. The sandbox also covers the
+    helper (sudo starts it inside the unit), so the helper's own paths are listed as writable
+    (`/etc/pecan`, `/etc/suricata`, `/var/lib/suricata`); the panel user has no write permission there.
+  - `KillMode=process`: restarting the panel never kills a running rule change; the helper finishes or
+    rolls back on its own.
+  - **Root-run code is no longer read from the home directory.** The pipeline (root), the traffic
+    generator (root) and the honeypot (`CAP_NET_ADMIN`) run root-owned copies in `/opt/pecan`
+    (`deploy/install-code.sh`), and the pipeline uses its own root-owned virtual environment
+    (`/opt/pecan/venv`). Before, a file the normal user could edit ran as root, so anyone who
+    compromised the panel (which runs as that user) could have become root. The anomaly model moved
+    there too: a `.joblib` file is a Python pickle, and loading one runs code. Data (`pecan.db`,
+    `.env`, `recon_active.json`) stays in the repository.
+
+**Key design decisions and why.**
+- **Flask + gunicorn, not waitress:** waitress has no HTTPS support (it needs a proxy in front), and the
+  panel must be HTTPS; gunicorn does TLS itself and is one Kali package (`python3-gunicorn`).
+- **One root helper, not a root web app:** a bug in the web code can at most call the helper's fixed
+  commands, whose arguments it validates itself.
+- **Structured custom rules only:** free rule text could add any Suricata keyword (or break the
+  configuration); the form's text field is written as hex for `" ; \ |`.
+
+**Measured results.**
+- Rule reloads during the live tests (2026-10-19): **281 `kernel_drops` (0.06%)** in total.
+- One rule-group change takes **~95 s on the Pi 4** (rebuild + full `suricata -T` ~30 s + live reload).
+  Own rules: ~0.3 s test, then reload.
+- Live-verified on the Pi: IP lists and timed blocks (phase 3), a rule-group change (Games
+  53053 -> 53030 -> 53053 rules), own rule add/edit/on-off, live feed, filters, search, details,
+  System card (phase 5). The phase-6 systemd unit: see the checks in `CLAUDE.md`.
+
+**Known limitations / trade-offs.**
+- **Login lockout is in memory:** a panel restart clears it (and the rule-job list). An attacker who
+  could restart the service could get more guesses; they can't restart it without root.
+- **`NoNewPrivileges` stays off.** It would block `sudo` (setuid), i.e. every change from the panel.
+  The trade-off is accepted because sudo only allows the one helper, which validates every argument.
+  The honeypot service keeps `NoNewPrivileges=yes`.
+- **While Tailscale is down, the panel is down** (also on the LAN), a consequence of binding to the
+  `tailscale0` device. `eth0` has never been tested live (no cable plugged in).
+- Self-signed certificate: a browser warning, and the certificate's IP list goes stale when the
+  hotspot IP changes (re-run `make-cert`).
+- One admin account, no roles, no audit log in the panel itself (the helper's journal log is the audit
+  trail).
+
+### 5.10 Demo checklist (5-minute video)
+
+**Before recording** (off camera):
+- `systemctl is-active suricata pecan-pipeline pecan-honeypot pecan-panel`: all `active`.
+- Laptop on the same hotspot as the Pi **and** on Tailscale. Open the panel over Tailscale
+  (`https://<pi-tailscale-ip>:8443/`), accept the certificate warning once, log out.
+- Note the laptop's hotspot IP (`ip -br addr`) and the Pi's `wlan0` IP. Check neither is on a list.
+- Simple mode selected, the Games rule group **on**, no own rules left from testing.
+- A terminal on the laptop ready with `nc <pi-wlan0-ip> 2222`.
+
+**Click order** (times are a guide):
+
+| Time | Do | Say |
+|---|---|---|
+| 0:00 | Login page: type the password, sign in | HTTPS, one admin password, locks out after 5 wrong tries, logs out after 30 min idle |
+| 0:20 | Home, Simple mode: point at the big status, the service dots, the four switches | What the owner sees; plain words, no jargon |
+| 0:45 | "What's happening now": one row, the "normal events hidden" line | Every alert is judged by the AI; normal ones are counted, not shown |
+| 1:05 | **What to watch for**: switch **Online games** off; let it run | Rebuild, full test, live reload, ~95 s; rolls back on any failure. Keep talking while it runs |
+| 1:15 | Laptop terminal: `nc <pi-wlan0-ip> 2222`, then Ctrl-C | The trap door: nothing real runs on 2222 |
+| 1:30 | Panel (still reachable: it is on Tailscale): the new row "Someone tried the trap door", and the laptop's IP under **Blocked for a while** | Blocked first, AI explains after; Tailscale is never filtered, so the admin keeps access |
+| 2:00 | Click **Unblock** on that IP | A mistake is one click to undo; blocks also expire on their own |
+| 2:15 | **Always blocked**: add `203.0.113.7`, name "Demo"; then try the Pi's gateway IP | Permanent block; the gateway is refused in plain words (it would cut the Pi off). Remove 203.0.113.7 |
+| 2:50 | Back to rules: Games now shows off (job finished) | Show the step messages if still running |
+| 3:00 | **New rule**: name "Telnet going out", TCP, from home, to outside, port 23, Add rule | Structured form, not free text; tested on its own (~0.3 s) before reload |
+| 3:25 | Switch **Explain alerts in plain English** off, then on | Off = nothing is sent to the AI service; takes effect within 30 s, no restart |
+| 3:45 | Switch to **IT** mode: filter detection = honeypot, search the laptop IP, open the row | Every stored field: SID, score, AI reason, firewall action |
+| 4:15 | **System** card: `kernel_drops`, Suricata memory, Groq limits; the raw text of the Telnet rule | The analyst view; drops show Suricata isn't starved |
+| 4:40 | Sign out | |
+
+**After recording:** switch Games back on (~95 s), remove the Telnet rule, check
+`journalctl -t pecan-helper --since today` shows every change (good b-roll for the audit trail).
+
 ---
 
 ## 6. Thesis findings
@@ -506,6 +635,7 @@ thresholds (commit 3bf52c9).
 | 3.1 Modules | Add Honeypot + prevention and Recon/VAPT as built modules; describe the eight modules in Section 5. State "IDPS", not only IDS. Mark anomaly detection as built and evaluated but live scoring pending the uni baseline. |
 | 3.2 Tech Stack | Replace with the table in Section 3 (Kali, Groq gpt-oss-120b, 8 GB, Suricata 8.0.7, Tailscale, SQLite, Textual, WeasyPrint, scikit-learn, nftables, nmap/searchsploit). |
 | Design diagrams (ERD, DFD, UML) | Redraw (Section 8). |
+| 3.x Interface | Two interfaces: the Textual TUI (analyst, SSH) and the web control panel (owner + IT mode, Section 5.9). Security design: one root helper, sudoers line, interface restriction, root-owned code in `/opt/pecan`. |
 | **New: Implementation chapter** | Architecture (Section 4), per-module "how it works" and "design decisions" (Section 5), deployment (systemd services, log rotation fix), security hardening of the honeypot service. |
 | **New: Results / Evaluation chapter** | Section 6: baseline 1 and replay results, domain shift, CIC-IDS2017 tables, honeypot and recon live tests, verdict-consistency fix, backfill numbers, performance fix. Leave placeholders for uni baseline, live tests, Cisco SPAN lab, demo. |
 | **New: Limitations / Discussion** | Every "Known limitations" list in Section 5; HOME_NET effect; partly synthetic baseline; Tailscale blind spots. |

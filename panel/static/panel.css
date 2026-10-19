@@ -149,6 +149,9 @@ h3 { font-size: .95rem; margin: 0 0 8px; }
   background: rgba(15,39,71,.1); color: var(--muted); border-radius: 6px; padding: 1px 6px; vertical-align: 1px; }
 .rule-card .rule-actions { display: flex; gap: 6px; align-items: center; flex: none; margin-left: auto; }
 .rule-card .job, .rule-card .rule { flex-basis: 100%; margin: 0; }
+/* The raw rule line is the card's last child, so `li > :last-child { flex: none }` would keep it at
+   full text width and push the whole page sideways: let it shrink and wrap inside the card. */
+.iplist li.rule-card > .rule { flex: 1 1 100%; min-width: 0; overflow-wrap: anywhere; word-break: break-word; }
 .iplist button.toggle { display: flex; background: transparent; padding: 4px 0 4px 4px; }
 .toggle:focus-visible { outline: 2px solid var(--blue); outline-offset: 2px; }
 /* Fields line up at the top, so an error under one box never stretches its neighbour. */

@@ -1,0 +1,8 @@
+# Root-owned venv for pecan-pipeline.service (/opt/pecan/venv, --system-site-packages):
+#   sudo python3 -m venv --system-site-packages /opt/pecan/venv
+#   sudo /opt/pecan/venv/bin/pip install -r deploy/requirements-root.txt
+# Same versions as the user's .venv (the anomaly model must load with the scikit-learn that
+# trained it); everything else (numpy, scipy, joblib, httpx, pydantic, dotenv) comes from Kali.
+groq==1.7.0
+scikit-learn==1.9.1
+threadpoolctl==3.7.0

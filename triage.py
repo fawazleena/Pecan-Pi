@@ -9,9 +9,9 @@ from collections import deque
 from datetime import datetime, timedelta
 from dotenv import load_dotenv
 from groq import Groq, APIStatusError, RateLimitError
-from netinfo import host_ips, gateways
+from netinfo import DATA, host_ips, gateways
 
-load_dotenv()
+load_dotenv(DATA / ".env")
 client = Groq(api_key=os.getenv("GROQ_API_KEY"), max_retries=0)  # retries are done here, see call()
 MODEL = "openai/gpt-oss-120b"
 

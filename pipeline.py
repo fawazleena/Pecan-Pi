@@ -7,7 +7,9 @@ EVE = "/var/log/suricata/eve.json"
 DB = "pecan.db"
 BATCH_SECONDS = 30
 IGNORE_SIDS = {9000001}  # ping test rule
-ANOMALY_MODEL = "anomaly_model.joblib"
+# Next to the code, not in the data dir: joblib files are pickles (loading one runs code), so
+# the root service only loads the root-owned copy in /opt/pecan.
+ANOMALY_MODEL = os.path.join(os.path.dirname(os.path.abspath(__file__)), "anomaly_model.joblib")
 HONEYPOT_LOG = "/var/log/pecan/honeypot.json"  # written by honeypot.py (pecan-honeypot.service)
 AI_OFF = ("unknown", "unknown", "AI explanations off")  # not 'AI unavailable': backfill.py must skip these
 

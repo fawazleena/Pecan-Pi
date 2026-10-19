@@ -28,6 +28,8 @@ sudo .venv/bin/python recon.py discover 192.168.221.65   # VAPT: nmap -sV a targ
 .venv/bin/python recon.py review [--scan N]              # list findings + proposed non-destructive check + reasoning
 sudo .venv/bin/python recon.py approve <finding_id>      # run ONLY that finding's read-only check, then triage it
 sudo .venv/bin/python recon.py decline <finding_id> [--note ...]
+.venv/bin/python panel.py set-password | make-cert [--ip IP] | serve [--host IP]   # web panel (normally pecan-panel.service)
+sudo sh deploy/install-code.sh   # root-owned copies of root-run code -> /opt/pecan (+ pecan-helper)
 ```
 
 `GROQ_API_KEY` is read from `.env` (gitignored) via `load_dotenv()`.
@@ -51,6 +53,9 @@ Files in `deploy/` are copies of what is installed on the Pi; editing them in th
 | `deploy/pecan-honeypot.service` | `/etc/systemd/system/pecan-honeypot.service` (enable it) |
 | `deploy/logrotate-pecan` | `/etc/logrotate.d/pecan` |
 | `pecan-helper.py` | `/usr/local/sbin/pecan-helper` (`install -o root -g root -m 0755`, a copy, never a symlink) |
+| `pipeline.py` `triage.py` `netinfo.py` `anomaly.py` `honeypot.py` `trafficgen.sh` `tailscale_derp.json` (+ `anomaly_model.joblib` if present) | `/opt/pecan/` root-owned copies, via `deploy/install-code.sh` (also installs `pecan-helper`) |
+| `deploy/requirements-root.txt` | `/opt/pecan/venv` (root-owned venv, `--system-site-packages`) for `pecan-pipeline` |
+| `deploy/pecan-panel.service` | `/etc/systemd/system/pecan-panel.service` (enable it) |
 | `deploy/sudoers-pecan` | `/etc/sudoers.d/pecan` (`install -m 0440`, then `visudo -cf`) |
 | `deploy/pecan-protected.txt` | `/etc/pecan/protected.txt` (`install -o root -g root -m 0644`) |
 
@@ -65,6 +70,8 @@ Panel rules (phase 4, `pecan-helper rules-category|custom-add|custom-remove`, on
 The stock logrotate config HUPed a pidfile path our override doesn't use, so Suricata never reopened its logs after rotation; the repo version HUPs via `systemctl kill` and uses `delaycompress`. It also sets `daily` + `maxsize 100M` (keep 14): with no frequency it inherited `weekly` from `/etc/logrotate.conf`, so eve.json reached 443 MB in 3.7 days (~120 MB/day). The system logrotate runs only once a day, so `pecan-logrotate.timer` runs this one file hourly to enforce the size cap (`Nice=19`, idle I/O). The Pi has no RTC: after it was off 2026-10-08 15:41 -> 10-15 23:57 the journal shows the boot at the old shutdown time until NTP syncs. `pipeline.py` detects rotation (inode change) and truncation and reopens `eve.json`.
 
 After changing one, copy it into place, then `sudo systemctl daemon-reload` and restart the relevant unit (`pecan-pipeline` or `suricata`). Logs: `journalctl -u pecan-pipeline -f`.
+
+**Root-run code never runs from `/home/raven`** (phase 6, 2026-10-19): the pipeline (root), trafficgen (root) and honeypot (`CAP_NET_ADMIN`) run root-owned copies in `/opt/pecan`, so editing a `.py` in the repo changes nothing live until `sudo sh deploy/install-code.sh` + restart. Reason: the panel runs as `raven`; if `raven`-writable files ran as root, a panel compromise would be root. The pipeline's data stays in the repo: `WorkingDirectory` + `PECAN_DATA=/home/raven/pecan-pi` (`netinfo.DATA`: `.env`, `recon_active.json`; `pecan.db` relative to the working dir); manual runs from the repo default `DATA` to the script's own dir, as before. The anomaly model is loaded from next to the code (`/opt/pecan/anomaly_model.joblib`): joblib = pickle = code. `install-code.sh` never deletes it; retire it with `sudo rm`.
 
 The pipeline service has no `User=`, so it runs as root and `pecan.db` is root-owned; running `pipeline.py` manually as a regular user will fail to write the DB (and may lack read access to `eve.json`). Stop the service before running it manually to avoid two writers.
 
@@ -90,10 +97,36 @@ The "P" in IDPS. A decoy SSH service on TCP 2222 (nothing legitimate runs there)
 - **Block first, AI after:** the block is immediate and does not depend on the AI verdict (AI may be down; the banner is attacker-controlled text, so prompt injection cannot unblock anyone). Blocking happens only after a completed TCP handshake, so a spoofed source cannot get someone else blocked.
 - **nftables:** own table `inet pecan`, sets `blocked4`/`blocked6` with `timeout` (`PECAN_BLOCK_SECONDS`, default 3600; kernel expires them, even if the service crashed), chain at input priority -10, policy accept. Permanent denylist: sets `denied4`/`denied6` (`flags interval`, no timeout), filled from `/etc/pecan/denylist.txt` at startup and kept in sync live by `pecan-helper`; enforced only while the service runs (overlapping entries are skipped, and if nft rejects the denylist the honeypot starts without it rather than not at all). Only `iifname wlan0/eth0` is filtered, so `tailscale0` (SSH over Tailscale) and `lo` are never touched. Exempt: UDP 41641 (Tailscale's WireGuard; keeps a laptop's direct Tailscale path up when its LAN IP is blocked; WireGuard ignores unauthenticated packets), and established connections to 2222 (so the decoy can finish reading the connection that caused the block). Restart, stop (`ExecStopPost` deletes the table) and reboot all clear every block: deliberately not persisted.
 - **Allowlist** (re-read at every hit, hotspot IPs change; `netinfo.py`): loopback, the Pi's IPs, default gateway(s), anything whose local address is on `tailscale0` (by interface, not by 100.64.0.0/10, which is also carrier-grade NAT space), the panel's `/etc/pecan/protected.txt` and `allowlist.txt` (no restart needed). Deliberately NOT allowlisted: IPs with an established SSH session (TCP to :22 is ESTABLISHED before authentication). Allowlisted hits are still logged and triaged (`not blocked: allowlisted (...)`).
-- **Service:** `DynamicUser` + only `CAP_NET_ADMIN`, `ProtectSystem=strict`, system `python3` (stdlib only); `/home/raven` is 0700, so `honeypot.py` and `netinfo.py` are bind-mounted to `/opt/pecan` read-only. `Nice=10`, `CPUQuota=10%`, `MemoryMax=64M`, max 50 concurrent connections. Editing either file needs `sudo systemctl restart pecan-honeypot`.
+- **Service:** `DynamicUser` + only `CAP_NET_ADMIN`, `ProtectSystem=strict`, system `python3` (stdlib only); runs the root-owned copies in `/opt/pecan` (`ProtectHome=yes`). `Nice=10`, `CPUQuota=10%`, `MemoryMax=64M`, max 50 concurrent connections. Editing either file needs `sudo sh deploy/install-code.sh && sudo systemctl restart pecan-honeypot`.
 - **Installed block time is 600 s, not the repo's 3600 s:** a drop-in (`sudo systemctl edit pecan-honeypot` -> `/etc/systemd/system/pecan-honeypot.service.d/override.conf`, `[Service]` `Environment=PECAN_BLOCK_SECONDS=600`) is kept for testing and the demo. Back to 1 h: `sudo systemctl revert pecan-honeypot && sudo systemctl restart pecan-honeypot`. Check: `systemctl show pecan-honeypot -p Environment`.
 - **Live test passed (2026-10-16):** `nc` from the laptop's hotspot IP (192.168.221.65) to 2222 was logged with its banner and blocked (nc + ping timed out); Tailscale ping and SSH stayed up; DB row 2725: `detection=honeypot`, `action=blocked 600s`, AI `suspicious`/`medium`; `honeypot.py unblock` restored access.
 - **Limitations for the thesis:** a scanner that never touches 2222 is not blocked; IP blocks are weak against an attacker who changes IP; Tailscale and the gateway are a deliberate blind spot; blocks do not survive reboot by design. nmap's default/top-1000 port lists may include 2222: the anomaly live test from the laptop (step 7) and the Recon module's own scans can block their own source, so unblock between tests.
+
+## Control panel (`panel.py`, `pecan-panel.service`)
+
+Flask, HTTPS on port 8443 (self-signed cert from `make-cert`, includes the current tailscale0 + wlan0 IPs; re-run after a hotspot change), one admin password (scrypt hash + secret key in `.env`). Runs as `raven`, reads `pecan.db` read-only; every root action goes through `pecan-helper` (one sudoers line). Simple mode (owner) and IT mode (analyst): status, live feed (`/api/feed` polled every 2 s), switches, IP lists, timed blocks, rule groups, own rules (details in the deployment section above). Frontend: `panel/templates`, `panel/static` (no inline JS/CSS: strict CSP). Full write-up: `docs/implementation-notes.md` 5.9.
+
+- **Server:** gunicorn (`python3-gunicorn`, Kali package, seen through the venv's system site-packages), started by `panel.py serve` (falls back to Werkzeug when gunicorn is missing, e.g. on a laptop). Not waitress: it has no TLS. **One worker, 8 threads:** login lockout, the `kernel_drops` trend and rule jobs are in-process memory.
+- **Unit:** `User=raven`, `--host 0.0.0.0`, `RestrictNetworkInterfaces=lo wlan0 tailscale0` (by interface, since hotspot IPs change; **never eth0**, future SPAN port). systemd resolves those names to interface numbers at start and tailscaled recreates `tailscale0` on every start, so the unit `BindsTo=` the tailscale0 device and is `WantedBy=` it: stops with it, starts again with it. Trade-off: Tailscale down = panel down (LAN too). `ProtectSystem=strict`, `ProtectHome=read-only`, `PrivateTmp`; `ReadWritePaths=/etc/pecan /etc/suricata /var/lib/suricata -/run/sudo -/run/suricata` because the sandbox also applies to the helper sudo starts inside the unit. **`NoNewPrivileges` must stay off** (sudo is setuid). No `CPUQuota`/`MemoryMax`: the helper's `suricata -T` (~1.4 GB) runs in this cgroup. `KillMode=process`: a panel restart never kills a running rule change.
+- **Known in-memory state:** login lockout (5 fails / IP / 15 min) and the job list reset when the panel restarts.
+- **Measured (2026-10-19):** rule reloads during the live tests cost 281 `kernel_drops` (0.06%) in total; one rule-group change ~95 s on the Pi 4.
+- Logs: `journalctl -u pecan-panel -f` (gunicorn errors + `login ok/failed from IP`), `journalctl -t pecan-helper` (every change).
+
+### Demo checklist (5-minute video; full table with timings and talking points: implementation-notes 5.10)
+
+Before: all four services active; laptop on the hotspot and on Tailscale, panel open over Tailscale, cert accepted, logged out; Simple mode, Games group on, no leftover own rules; laptop terminal ready with `nc <pi-wlan0-ip> 2222`.
+
+1. Log in (HTTPS, lockout, idle logout).
+2. Simple mode: big status, service dots, four switches.
+3. Feed: one row, the "normal events hidden" line.
+4. Rules: switch **Online games** off and keep going while it runs (~95 s).
+5. Laptop: `nc <pi-wlan0-ip> 2222`, Ctrl-C. Panel (still up over Tailscale): "Someone tried the trap door" row + laptop IP under **Blocked for a while**.
+6. **Unblock** it.
+7. **Always blocked**: add `203.0.113.7` "Demo"; try the gateway IP (refused in plain words); remove 203.0.113.7.
+8. Games shows off. **New rule**: "Telnet going out", TCP, home -> outside, port 23.
+9. **Explain alerts in plain English** off, then on.
+10. IT mode: filter honeypot, search the laptop IP, open the row; System card (`kernel_drops`, Groq limits); raw rule text.
+11. Sign out. After: Games back on, remove the Telnet rule, `journalctl -t pecan-helper --since today`.
 
 ## Reconnaissance / VAPT (`recon.py`)
 
@@ -123,7 +156,7 @@ PDF for a time range (`--since`/`--until`, local time, compared against `seen_at
 
 ## Anomaly detection (`anomaly.py`; DISABLED pending baseline 2)
 
-**Status (2026-10-16):** live scoring is **off**. The baseline-1 model was renamed to `anomaly_model.friend.joblib`, so `pipeline.py` logs `anomaly detection off: no anomaly_model.joblib`; signatures + AI triage run as normal. Reason: domain shift (below), which also spent a Groq request almost every 30 s batch (anomalies are never cached). **Baseline 2 is collected on the uni network starting Sunday 2026-10-18**, then the step 5 checklist runs again on it.
+**Status (2026-10-16):** live scoring is **off**. The baseline-1 model was renamed to `anomaly_model.friend.joblib`, so `pipeline.py` logs `anomaly detection off: no /opt/pecan/anomaly_model.joblib`; signatures + AI triage run as normal. Reason: domain shift (below), which also spent a Groq request almost every 30 s batch (anomalies are never cached). **Baseline 2 is collected on the uni network starting Sunday 2026-10-18**, then the step 5 checklist runs again on it.
 
 Isolation Forest on Suricata `flow` events, as a second detector next to signatures. Phases: collect baseline -> `snapshot` -> train -> live scoring inside `pipeline.py`. Broadcast/multicast destinations are excluded in both training and scoring (`is_broadcast_or_multicast`), since that chatter depends on which network the Pi is on.
 
@@ -188,7 +221,7 @@ For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out ba
 
 1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
 2. **Freeze the baseline:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --until <now>` -> `baseline_flows.jsonl`. Record the until-time and flow counts for the thesis.
-3. **Train:** `sudo nice -n 19 .venv/bin/python anomaly.py train` (sudo: the root-run pipeline must read the model). Record: fit/calibration sizes, threshold, held-out FP rate. Keep `--fp-budget 2` unless the held-out FP rate says otherwise; never tune it on attack results.
+3. **Train:** `sudo nice -n 19 .venv/bin/python anomaly.py train` (sudo: the root-run pipeline must read the model). Record: fit/calibration sizes, threshold, held-out FP rate. Keep `--fp-budget 2` unless the held-out FP rate says otherwise; never tune it on attack results. Then `sudo sh deploy/install-code.sh` (copies the model to `/opt/pecan`, the only one the service loads).
 4. **Offline evaluation (separate from calibration):** `make_replay.py baseline_flows.jsonl --pi <pi-ip> --peer <laptop-ip> --out-dir replay`, then `anomaly.py train --baseline replay/train.jsonl --out replay/model.joblib` and `anomaly.py eval replay/<file>.jsonl --model replay/model.joblib` for holdout, scan_pi_to_peer, scan_peer_to_pi, slow_scan_peer_to_pi, sweep_pi_ssh. Record FP on real flows and detection on synthetic per file.
 5. **Turn it on:** `sudo systemctl restart pecan-pipeline`; journal must say `anomaly detection on`. Note `kernel_drops` (`tail -n 2000 /var/log/suricata/eve.json | grep '"event_type":"stats"' | tail -1 | jq .stats.capture.kernel_drops`).
 6. **Live test A (Pi -> laptop):** on the Pi, `nmap -sT -T3 --top-ports 1000 <laptop-ip>` (connect scan, no scripts/version/OS detection). Wait ~2 min (flow timeout + 30s batch), then `sqlite3 pecan.db "SELECT id,detection,src_ip,dest_ip,count,score,signature,verdict,priority,reason FROM alerts WHERE detection='anomaly' ORDER BY id DESC LIMIT 5"`. Expect one anomaly row from the Pi with ~1000 ports and a real AI verdict. Note whether an `ET SCAN` signature also fired.

@@ -6,6 +6,9 @@ the root-owned pecan-helper (one sudoers line, fixed subcommands, argv only, nev
     .venv/bin/python panel.py set-password     # store the admin password hash + secret key in .env
     .venv/bin/python panel.py make-cert        # self-signed TLS cert -> panel/tls/ (gitignored)
     .venv/bin/python panel.py serve [--host IP] [--port 8443]   # default host: the Pi's tailscale0 IP
+
+On the Pi it runs as pecan-panel.service (gunicorn, --host 0.0.0.0): systemd's
+RestrictNetworkInterfaces then decides by interface that only lo, wlan0 and tailscale0 reach it.
 """
 import argparse, getpass, json, os, re, secrets, shutil, sqlite3, subprocess, sys, threading, time
 from datetime import datetime, timedelta, timezone
@@ -19,7 +22,7 @@ from netinfo import iface_ips, load_settings, load_ip_list
 HERE = Path(__file__).parent
 ENV = HERE / ".env"
 DB = HERE / "pecan.db"
-MODEL = HERE / "anomaly_model.joblib"   # pipeline.py's ANOMALY_MODEL (its working dir is HERE)
+MODEL = Path("/opt/pecan/anomaly_model.joblib")   # pipeline.py's ANOMALY_MODEL (the installed copy)
 EVE = "/var/log/suricata/eve.json"
 TLS = HERE / "panel" / "tls"
 HELPER = "/usr/local/sbin/pecan-helper"   # installed copy of pecan-helper.py, root:root 0755
@@ -716,7 +719,8 @@ def cmd_make_cert(a):
     TLS.mkdir(parents=True, exist_ok=True)
     TLS.chmod(0o700)
     san = ",".join(["DNS:" + os.uname().nodename, "DNS:localhost", "IP:127.0.0.1"]
-                   + [f"IP:{ip}" for ip in iface_ips("tailscale0") + a.ip if not ip.startswith("fe80")])
+                   + [f"IP:{ip}" for ip in iface_ips("tailscale0") + iface_ips("wlan0") + a.ip
+                      if not ip.startswith("fe80")])
     r = subprocess.run(["openssl", "req", "-x509", "-newkey", "ec", "-pkeyopt", "ec_paramgen_curve:prime256v1",
                         "-nodes", "-days", "825", "-subj", "/CN=Pecan Pi panel", "-addext", f"subjectAltName={san}",
                         "-keyout", str(TLS / "key.pem"), "-out", str(TLS / "cert.pem")],
@@ -737,10 +741,31 @@ def cmd_serve(a):
     host = a.host or next(iter(iface_ips("tailscale0")), None)
     if not host:
         sys.exit("tailscale0 has no address; pass --host")
-    from werkzeug.serving import run_simple
     print(f"panel on https://{host}:{a.port}/")
-    run_simple(host, a.port, app, threaded=True,
-               ssl_context=(str(TLS / "cert.pem"), str(TLS / "key.pem")))
+    try:
+        from gunicorn.app.base import BaseApplication
+    except ImportError:   # e.g. on a laptop without python3-gunicorn: Werkzeug's development server
+        from werkzeug.serving import run_simple
+        run_simple(host, a.port, app, threaded=True,
+                   ssl_context=(str(TLS / "cert.pem"), str(TLS / "key.pem")))
+        return
+
+    class Server(BaseApplication):
+        # One worker process on purpose: login lockouts, the kernel_drops trend and rule-change
+        # jobs live in this process's memory, so a second worker would see different state.
+        # Threads serve the polling requests (status, feed, jobs) side by side.
+        def load_config(self):
+            for k, v in {"bind": f"{host}:{a.port}", "workers": 1, "worker_class": "gthread", "threads": 8,
+                         "certfile": str(TLS / "cert.pem"), "keyfile": str(TLS / "key.pem"),
+                         "timeout": 60, "graceful_timeout": 5, "errorlog": "-", "accesslog": None,
+                         "control_socket_disable": True}.items():   # gunicorn >= 26 only; /run is read-only
+                if k in self.cfg.settings:
+                    self.cfg.set(k, v)
+
+        def load(self):
+            return app
+
+    Server().run()
 
 
 def main():

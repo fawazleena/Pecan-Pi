@@ -5,9 +5,11 @@ Wants=suricata.service network-online.target
 
 [Service]
 Type=simple
+# Runs as root: root-owned code and venv in /opt/pecan (deploy/install-code.sh), never the
+# user-writable repo. Data (pecan.db, .env, recon_active.json) stays in the repo (PECAN_DATA).
 WorkingDirectory=/home/raven/pecan-pi
-ExecStart=/home/raven/pecan-pi/.venv/bin/python pipeline.py
-Environment=PYTHONUNBUFFERED=1
+ExecStart=/opt/pecan/venv/bin/python /opt/pecan/pipeline.py
+Environment=PYTHONUNBUFFERED=1 PYTHONDONTWRITEBYTECODE=1 PECAN_DATA=/home/raven/pecan-pi
 Restart=on-failure
 Nice=10
 CPUQuota=50%
