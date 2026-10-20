@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, session, url_for
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
-from netinfo import iface_ips, load_settings, load_ip_list
+from netinfo import iface_ips, load_settings, load_ip_list, load_anomaly_iface
 
 HERE = Path(__file__).parent
 ENV = HERE / ".env"
@@ -424,6 +424,9 @@ def system_info():
                  ("Pipeline", "newest row", local_time(newest) if newest else "none")]
     except sqlite3.Error:
         rows.append(("Pipeline", "alert rows", "n/a"))
+    # Read-only here; set with `sudo pecan-helper set-anomaly-iface all|eth0|wlan0`.
+    iface = load_anomaly_iface()
+    rows.append(("Pipeline", "anomaly interface", f"{iface} only" if iface else "all"))
     # The pipeline logs Groq's rate-limit headers on every call (needs journal access: group adm).
     line = subprocess.run(["journalctl", "-u", "pecan-pipeline", "--since", "-24h", "--grep", "groq limits",
                            "-n", "1", "-o", "short-iso", "--no-pager", "-q"], capture_output=True, text=True).stdout.strip()

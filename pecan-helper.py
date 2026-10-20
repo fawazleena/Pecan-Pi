@@ -13,6 +13,7 @@ commands first print progress lines ("step: rebuilding|testing|reloading") so th
 Validation messages start with the field they are about ("port: ...").
 
     pecan-helper set-switch signatures|anomaly|auto_block|ai on|off
+    pecan-helper set-anomaly-iface all|eth0|wlan0    # interface live anomaly scoring uses
     pecan-helper list-add allow|deny IP-or-CIDR [NOTE]
     pecan-helper list-remove allow|deny IP-or-CIDR
     pecan-helper list-blocks            # JSON: the honeypot's current timed blocks
@@ -29,6 +30,7 @@ ETC = "/etc/pecan"
 SETTINGS = ETC + "/settings.json"
 # Same names and defaults as netinfo.SWITCHES / load_settings(); duplicated on purpose (see above).
 SWITCHES = ("signatures", "anomaly", "auto_block", "ai")
+ANOMALY_IFACES = ("all", "eth0", "wlan0")   # netinfo.ANOMALY_IFACES + "all" (no filter)
 # Same files and format as netinfo.IP_LISTS / load_ip_list(). protected.txt is installed by hand
 # (deploy/pecan-protected.txt) and no command here can change it.
 LISTS = {"allow": ETC + "/allowlist.txt", "deny": ETC + "/denylist.txt", "protected": ETC + "/protected.txt"}
@@ -51,13 +53,17 @@ def fail(msg, code=2):
 
 
 def read_settings():
-    """Current switches; a missing or broken file counts as all on, like the readers do."""
+    """Current settings; a missing or broken file counts as all on / all interfaces, like the
+    readers do. Every known key is kept, so one command never drops another's setting."""
     out = dict.fromkeys(SWITCHES, True)
+    out["anomaly_iface"] = "all"
     try:
         with open(SETTINGS) as f:
             data = json.load(f)
         if isinstance(data, dict):
             out.update({k: data[k] for k in SWITCHES if isinstance(data.get(k), bool)})
+            if data.get("anomaly_iface") in ANOMALY_IFACES:
+                out["anomaly_iface"] = data["anomaly_iface"]
     except (OSError, ValueError):
         pass
     return out
@@ -98,6 +104,17 @@ def set_switch(args):
         settings[args[0]] = args[1] == "on"
         write_settings(settings)
     log(f"result=ok {args[0]}={args[1]}")
+    print(json.dumps(settings))
+
+
+def set_anomaly_iface(args):
+    if len(args) != 1 or args[0] not in ANOMALY_IFACES:
+        fail("usage: set-anomaly-iface " + "|".join(ANOMALY_IFACES))
+    with locked():
+        settings = read_settings()
+        settings["anomaly_iface"] = args[0]
+        write_settings(settings)
+    log(f"result=ok anomaly_iface={args[0]}")
     print(json.dumps(settings))
 
 
@@ -635,7 +652,7 @@ def custom_remove(args):
     print(json.dumps({"ok": True, "applied": applied}))
 
 
-COMMANDS = {"set-switch": set_switch, "list-add": list_add, "list-remove": list_remove,
+COMMANDS = {"set-switch": set_switch, "set-anomaly-iface": set_anomaly_iface, "list-add": list_add, "list-remove": list_remove,
             "list-blocks": list_blocks, "unblock": unblock, "rules-category": rules_category,
             "custom-add": custom_add, "custom-edit": custom_edit, "custom-toggle": custom_toggle,
             "custom-remove": custom_remove}

@@ -112,6 +112,22 @@ def load_settings():
     return out, None
 
 
+# Suricata's capture interfaces (deploy/override.conf). "anomaly_iface" in settings.json limits
+# live anomaly scoring to one of them, to match a baseline snapshotted with --iface (e.g. a lab
+# SPAN port on eth0). Same values in pecan-helper ("all" = no filter).
+ANOMALY_IFACES = ("eth0", "wlan0")
+
+
+def load_anomaly_iface():
+    """The one interface live anomaly scoring uses, or None for all. Missing, unreadable or
+    unknown means all: how the pipeline behaved before the setting existed."""
+    try:
+        value = json.loads(SETTINGS.read_text()).get("anomaly_iface")
+    except (OSError, ValueError, AttributeError):
+        return None
+    return value if value in ANOMALY_IFACES else None
+
+
 # --- IP lists (panel) -------------------------------------------------------------------------
 # Written only by pecan-helper (allowlist, denylist) or installed by hand (protected), read by
 # the honeypot (every hit, and the denylist at startup) and the panel. One entry per line,

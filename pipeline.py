@@ -1,7 +1,7 @@
 import json, os, time
 from datetime import datetime, timezone
 from triage import open_db, collapse, cached, triage_all, UNTRIAGED, SELF_RECON_TAG
-from netinfo import host_ips, load_recon_marker, recon_covers_dest, load_settings
+from netinfo import host_ips, load_recon_marker, recon_covers_dest, load_settings, load_anomaly_iface
 
 EVE = "/var/log/suricata/eve.json"
 DB = "pecan.db"
@@ -72,6 +72,8 @@ def handle(line, pending):
         old = pending.get(key)
         pending[key] = (old[0], old[1] + 1) if old else (e, 1)
     elif e.get("event_type") == "flow" and scorer:
+        if anomaly_iface and e.get("in_iface") != anomaly_iface:
+            return  # filtered before the source window, as `anomaly.py snapshot --iface` does
         try:
             scorer.add(e)
         except Exception as err:
@@ -135,21 +137,24 @@ pending, hits = {}, {}
 eve = Tail(EVE, lambda line: handle(line, pending), wait=True)
 honeypot = Tail(HONEYPOT_LOG, lambda line: handle_hit(line, hits))
 
-settings, scorer, settings_error = None, None, None
+settings, scorer, settings_error, anomaly_iface = None, None, None, None
 
 def apply_settings():
     """Re-read the panel's switches (/etc/pecan/settings.json); log changes, load or drop the Scorer.
     Signature detection off: Suricata keeps running (its flows feed the anomaly detector), the
-    pipeline just ignores its alerts. AI off: rows are stored as AI_OFF, nothing goes to Groq."""
-    global settings, scorer, settings_error
+    pipeline just ignores its alerts. AI off: rows are stored as AI_OFF, nothing goes to Groq.
+    anomaly_iface: score flows from that interface only (None = all); a change starts a fresh Scorer."""
+    global settings, scorer, settings_error, anomaly_iface
     new, error = load_settings()
     if error and error != settings_error:
         print(f"settings unreadable, keeping everything on: {error}")
     settings_error = error
-    if new == settings:
+    new_iface = load_anomaly_iface()
+    if new == settings and new_iface == anomaly_iface:
         return
     old, settings = settings, new
-    if not (old and new["anomaly"] == old["anomaly"]):
+    iface_changed, anomaly_iface = new_iface != anomaly_iface, new_iface
+    if not (old and new["anomaly"] == old["anomaly"]) or iface_changed:
         scorer = None
         if not new["anomaly"]:
             print("anomaly detection off: switched off in the panel")
@@ -166,6 +171,7 @@ def apply_settings():
     state = {k: "on" if v else "off" for k, v in new.items()}
     if new["anomaly"] and not scorer:
         state["anomaly"] = "on (no model loaded)"
+    state["anomaly_iface"] = anomaly_iface or "all"
     print("switches: " + ", ".join(f"{k}={v}" for k, v in state.items()))
 
 apply_settings()
