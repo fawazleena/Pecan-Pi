@@ -1,7 +1,7 @@
 """Anomaly detection on Suricata flow events (Isolation Forest).
 
 Usage:
-  anomaly.py snapshot --since 2026-10-05 [--until 2026-10-07T18:00] [--out baseline_flows.jsonl]
+  anomaly.py snapshot --since 2026-10-05 [--until 2026-10-07T18:00] [--out baseline_flows.jsonl] [--iface eth0]
   nice -n 19 anomaly.py train [--baseline baseline_flows.jsonl] [--fp-budget 2.0] [--out anomaly_model.joblib]
   anomaly.py eval FILE [--model anomaly_model.joblib]
   anomaly.py derp-refresh    # update tailscale_derp.json from `tailscale debug derp-map`
@@ -301,18 +301,23 @@ def local_time(s):
 def cmd_snapshot(a):
     since, until = local_time(a.since), local_time(a.until) if a.until else None
     files = eve_files()
-    kept = noise = 0
+    kept = noise = other_iface = 0
     first = last = None
     with open(a.out, "w") as out:
         for e in read_flows(files):
             t = parse_ts(e["timestamp"])
             if t < since or (until and t > until):
                 continue
+            if a.iface and e.get("in_iface") != a.iface:
+                other_iface += 1
+                continue
             out.write(json.dumps(e) + "\n")
             kept += 1
             noise += excluded(e)
             first, last = first or t, t
     print(f"read {len(files)} file(s): {', '.join(os.path.basename(p) for p in files)}")
+    if a.iface:
+        print(f"kept only in_iface={a.iface}: {other_iface} flows from other interfaces skipped")
     print(f"wrote {kept} flows to {a.out} ({kept - noise} usable, {noise} broadcast/multicast/Tailscale relay excluded)")
     if first:
         print(f"span: {first.isoformat()} -> {last.isoformat()}")
@@ -388,6 +393,7 @@ def main():
     s.add_argument("--since", required=True, help="local time, e.g. 2026-10-05 or 2026-10-05T14:00")
     s.add_argument("--until")
     s.add_argument("--out", default=BASELINE)
+    s.add_argument("--iface", help="keep only flows captured on this interface (e.g. eth0 for a SPAN baseline); default: all")
     s.set_defaults(func=cmd_snapshot)
     t = sub.add_parser("train", help="fit the Isolation Forest on a baseline file")
     t.add_argument("--baseline", default=BASELINE)

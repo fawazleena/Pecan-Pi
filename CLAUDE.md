@@ -221,6 +221,8 @@ nice -n 19 .venv/bin/python cic_eval.py metrics # ablation -> cic/metrics.txt + 
 
 For baseline 2: replace `2026-10-04T22:32` with its start time and use `--out baseline_hotspot2.jsonl` (then `--baseline baseline_hotspot2.jsonl`) so baseline 1 stays for the thesis. Snapshot within ~a week of the start (logrotate keeps 14 files, rotating daily or at 100 MB). After freezing, delete its broadcast/multicast flows as was done for baseline 1, run `anomaly.py derp-refresh` before training, and use the Pi/laptop IPs on the current hotspot subnet for `make_replay.py`. No scans or tests on the Pi during collection.
 
+For a lab SPAN baseline on eth0, add `--iface eth0` to `snapshot` (filters on eve's `in_iface`; default keeps all interfaces, the old behaviour). Suricata already captures eth0 (`-i wlan0 -i eth0` in the override, own af-packet entry, cluster-id 99; wlan0 uses the `default` entry; 8 worker threads = 4 per interface). Live scoring in `pipeline.py` does not filter by interface.
+
 
 1. **Check size:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --out /tmp/x.jsonl`. Need ~2,000 *usable* flows (the line says how many broadcast/multicast were excluded).
 2. **Freeze the baseline:** `.venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32 --until <now>` -> `baseline_flows.jsonl`. Record the until-time and flow counts for the thesis.
