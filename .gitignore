@@ -10,3 +10,6 @@ replay/
 recon_active.json
 cic/
 panel/tls/
+
+# Report drafts and the format master (Word files are never committed)
+*.docx
