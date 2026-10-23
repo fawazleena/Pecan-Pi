@@ -263,8 +263,13 @@ def parse(text):
 
 
 def call(items, deadline):
-    """One Groq call with retries: back off on 429, signal TooLarge on 413."""
-    prompt = build_prompt(items)
+    """One Groq call with retries: back off on 429, signal TooLarge on 413. Returns {item's n: result}.
+
+    The prompt numbers the items 0..k-1 in order. Their batch n has gaps where cached items were
+    left out (e.g. 0,1,2,3,6), and the model then sometimes numbered its lines by position: on
+    2026-10-24 a CIC replay alert's verdict landed on a live STUN item (n=3 instead of 6) and the
+    cache spread it. Answers are mapped back to each item's own n; numbers outside 0..k-1 are dropped."""
+    prompt = build_prompt([{**it, "n": i} for i, it in enumerate(items)])
     tokens = estimate(prompt) + MAX_COMPLETION
     for attempt in range(3):
         wait_budget(tokens, deadline)
@@ -276,7 +281,8 @@ def call(items, deadline):
             r = raw.parse()
             if r.choices[0].finish_reason == "length":
                 print("AI warning: reply cut off at max_completion_tokens; missing lines stay untriaged")
-            return parse(r.choices[0].message.content or "")
+            got = parse(r.choices[0].message.content or "")
+            return {items[i]["n"]: v for i, v in got.items() if i < len(items)}
         except RateLimitError as err:
             log_limits(err.response.headers)
             try:
