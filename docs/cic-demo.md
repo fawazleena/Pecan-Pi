@@ -126,7 +126,7 @@ sudo timeout 700 tcpdump -ni wlan0 -c 5 'net 192.168.10.0/24 or host 172.16.0.1 
 ```
 Terminal 2:
 ```sh
-sudo sh -c 'python3 -I cic_replay.py cic/replay/fri_scan.pcap; python3 -I cic_replay.py cic/replay/fri_ddos.pcap'
+sudo sh -c 'python3 -I cic_replay.py cic/replay/fri_scan.pcap && python3 -I cic_replay.py cic/replay/fri_ddos.pcap'
 ```
 `kernel_drops` (no sudo): `tail -n 2000 /var/log/suricata/eve.json | grep '"event_type":"stats"' | tail -1 | jq .stats.capture`.
 

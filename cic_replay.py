@@ -95,6 +95,8 @@ def main():
     print(f"{'interrupted' if stop else 'done'}: {a.pcap} -> {a.iface}, started {start}, ended {time.strftime('%F %T')}\n"
           f"  sent {sent}, failed {failed}, pcap span {span:.1f}s, wall {time.monotonic() - wall0 if wall0 else 0:.1f}s, "
           f"largest frame {biggest} B, max lag behind original timing {max_lag * 1000:.0f} ms")
+    if stop:
+        sys.exit(130)   # like a shell's Ctrl-C status, so `a && b` stops after an aborted slice
 
 
 if __name__ == "__main__":
