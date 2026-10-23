@@ -67,7 +67,7 @@ scp "fri_scan.pcap" "fri_ddos.pcap" pecan:/home/raven/pecan-pi/cic/replay/
 ```sh
 sudo sh deploy/install-code.sh
 sudo systemctl restart pecan-pipeline pecan-panel
-sudo pecan-helper set-anomaly-iface cic0
+sudo /usr/local/sbin/pecan-helper set-anomaly-iface cic0
 ```
 Check: `journalctl -u pecan-pipeline --since -2min | grep switches` shows `anomaly_iface=cic0` and
 `anomaly=on (no model loaded)`.
@@ -88,7 +88,10 @@ sudo systemctl daemon-reload && sudo systemctl restart suricata
 sudo tcpreplay -i cic0 --limit=200 cic/replay/fri_scan.pcap
 ```
 `cic/suricata.yaml.cic-demo` (gitignored) = the installed yaml plus one af-packet entry before
-eth0: `interface: cic0`, `cluster-id: 98`, `cluster-type: cluster_flow`, `defrag: yes`, `threads: 1`
+eth0: `interface: cic0`, `cluster-id: 98`, `cluster-type: cluster_flow`, `defrag: yes`, `threads: 1`,
+`checksum-checks: no` (added after the first capture test: 6 of 200 replayed packets raised `SURICATA TCPv4
+invalid checksum` 2200074; the CIC evaluation ran `suricata -k none`, so flows match it only without the check;
+cic0 only, wlan0 keeps the default)
 (made by copying the live file and inserting only inside `af-packet:`; check with `diff`).
 Check: `eve.json` has events with `"in_iface":"cic0"`; `kernel_drops` 0 after the restart.
 Not persistent: `cic0` is gone after a reboot, and Suricata is started with `-i cic0`, so after an
@@ -137,7 +140,7 @@ Pi's (all RFC1918), so 172.16.0.1 counts as "home" and scan signatures stay quie
 ```sh
 sudo rm /opt/pecan/anomaly_model.joblib /opt/pecan/anomaly_model.meta.json
 sudo systemctl restart pecan-pipeline        # journal: "anomaly detection off: no /opt/pecan/anomaly_model.joblib"
-sudo pecan-helper set-anomaly-iface all
+sudo /usr/local/sbin/pecan-helper set-anomaly-iface all
 sudo rm /etc/systemd/system/suricata.service.d/zz-cic-demo.conf
 sudo cp -a /etc/suricata/suricata.yaml.pre-cic /etc/suricata/suricata.yaml
 sudo systemctl daemon-reload && sudo systemctl restart suricata
