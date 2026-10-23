@@ -14,5 +14,9 @@ install -o root -g root -m 0755 pecan-helper.py /usr/local/sbin/pecan-helper
 # Not removed when the repo has none: retire it with  sudo rm /opt/pecan/anomaly_model.joblib
 if [ -f anomaly_model.joblib ]; then
     install -o root -g root -m 0644 anomaly_model.joblib /opt/pecan/
+    # Its label (anomaly.py label); without one the panel shows the old label as not matching.
+    if [ -f anomaly_model.meta.json ]; then
+        install -o root -g root -m 0644 anomaly_model.meta.json /opt/pecan/
+    fi
 fi
 echo "installed into /opt/pecan:"; ls -l /opt/pecan

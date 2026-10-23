@@ -21,6 +21,7 @@ sudo .venv/bin/python backfill.py  # re-triage 'AI unavailable' rows (--dry-run:
 .venv/bin/python anomaly.py snapshot --since 2026-10-04T22:32   # copy flow events (eve.json + rotated files) into baseline_flows.jsonl
 nice -n 19 .venv/bin/python anomaly.py train               # fit Isolation Forest -> anomaly_model.joblib
 .venv/bin/python anomaly.py eval FILE.jsonl               # score a flow file with the live code path
+.venv/bin/python anomaly.py label MODEL --label TEXT      # MODEL.meta.json: label + sha256, shown in the panel
 .venv/bin/python make_replay.py SNAPSHOT --pi <pi-ip> --peer <laptop-ip> --out-dir replay   # offline attack replays (no network traffic)
 sudo python3 honeypot.py list | unblock IP | unblock-all   # current honeypot blocks (nftables table inet pecan)
 python3 honeypot.py serve --dry-run --port 2223          # decoy without firewall changes (service must not hold the port)
@@ -59,7 +60,7 @@ Files in `deploy/` are copies of what is installed on the Pi; editing them in th
 | `deploy/sudoers-pecan` | `/etc/sudoers.d/pecan` (`install -m 0440`, then `visudo -cf`) |
 | `deploy/pecan-protected.txt` | `/etc/pecan/protected.txt` (`install -o root -g root -m 0644`) |
 
-Panel main switches live in `/etc/pecan/settings.json` (root-owned, written only by `pecan-helper set-switch`, log: `journalctl -t pecan-helper`). `netinfo.load_settings()`: missing file/key = on; unreadable = on + error. Re-read by `pipeline.py` every flush (signatures, anomaly, AI: off stores `AI explanations off`, which `backfill.py` skips), by `honeypot.py` every hit (auto_block) and by `report.py` (AI off = `--no-ai`). No restart needed. `anomaly_iface` (`all`|`eth0`|`wlan0`, `pecan-helper set-anomaly-iface`; missing/unknown = all, the old behaviour): live anomaly scoring uses flows from that interface only (filtered before the per-source window, like `snapshot --iface`; a change starts a fresh Scorer); signatures are unaffected. Shown read-only in the IT System card (no panel control).
+Panel main switches live in `/etc/pecan/settings.json` (root-owned, written only by `pecan-helper set-switch`, log: `journalctl -t pecan-helper`). `netinfo.load_settings()`: missing file/key = on; unreadable = on + error. Re-read by `pipeline.py` every flush (signatures, anomaly, AI: off stores `AI explanations off`, which `backfill.py` skips), by `honeypot.py` every hit (auto_block) and by `report.py` (AI off = `--no-ai`). No restart needed. `anomaly_iface` (`all`|`eth0`|`wlan0`|`cic0`, `pecan-helper set-anomaly-iface`; missing/unknown = all, the old behaviour; `cic0` = the CIC-IDS2017 demo replay, below): live anomaly scoring uses flows from that interface only (filtered before the per-source window, like `snapshot --iface`; a change starts a fresh Scorer); signatures are unaffected. Shown read-only in the IT System card (no panel control).
 
 Panel IP lists (`netinfo.load_ip_list()`, one `IP-or-CIDR  # note` per line): `/etc/pecan/allowlist.txt` (trusted: never auto-blocked; max /16, IPv6 /48) and `denylist.txt` (always blocked; max /24, IPv6 /64) are written only by `pecan-helper list-add|list-remove`; `protected.txt` is installed by hand and no command changes it (admin laptop's Tailscale IP). The helper refuses a deny entry overlapping protected, trusted, the Pi's own IPs or gateway, and a trust entry overlapping a deny entry. Adding a trusted range lifts current timed blocks inside it; `list-blocks` / `unblock IP` show and lift timed blocks.
 
@@ -170,6 +171,10 @@ Isolation Forest on Suricata `flow` events, as a second detector next to signatu
 - Test attacks only with `make_replay.py` + `eval` during baseline collection: no live scans until the baseline snapshot is taken.
 
 The Pi's own traffic is too sparse for a baseline, so `trafficgen.sh` (systemd timer, every ~10 min, `Nice=19`) generates benign DNS lookups, a few HTTPS fetches, and apt update every 6h. **The baseline is therefore partly synthetic**; say so in the thesis. Do not scan or test during the baseline window.
+
+### CIC-IDS2017 live demo (`docs/cic-demo.md`, 2026-10-23)
+
+Live anomaly scoring shown with the CIC Monday model (`cic/model.joblib`, threshold -0.5862) on CIC Friday slices replayed (`tcpreplay`, 1x) into `cic0`, a `dummy` interface (no IP/peer, drops every frame: nothing reaches a real network). Suricata captures it via the temporary drop-in `deploy/cic-demo-suricata.conf` + an af-packet entry (`cluster-id: 98`, `threads: 1`); `anomaly_iface=cic0` is set before the model is installed and the model is removed first at teardown, so `wlan0` is never scored by it. Rows from `cic0` get the reason prefix `[cic-replay]` (`netinfo.REPLAY_TAG`), are never collapsed with real rows, never use/feed the verdict cache, and the AI is not told they are a replay. The panel shows the model's label from `/opt/pecan/anomaly_model.meta.json` only while its sha256 matches the model file (`netinfo.model_label()`). The pipeline logs `anomaly: scored N flows (iface), flagged M` per flush. Groq cost simulated at ~10 requests per 5-min slice. Teardown restores: switch on, no model, `anomaly_iface=all`.
 
 ### Thesis finding: domain shift (2026-10-16)
 

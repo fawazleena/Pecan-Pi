@@ -17,7 +17,7 @@ from dotenv import load_dotenv
 from flask import Flask, abort, jsonify, redirect, render_template, request, session, url_for
 from flask_wtf.csrf import CSRFProtect
 from werkzeug.security import check_password_hash, generate_password_hash
-from netinfo import iface_ips, load_settings, load_ip_list, load_anomaly_iface
+from netinfo import iface_ips, load_settings, load_ip_list, load_anomaly_iface, model_label
 
 HERE = Path(__file__).parent
 ENV = HERE / ".env"
@@ -248,6 +248,9 @@ def switches():
     if not MODEL.exists():   # the pipeline can't score without a model, whatever the setting says
         out[1].update(on=False, available=False,
                       note="Not available yet: still learning what normal looks like on this network.")
+    else:   # which model scores, e.g. "CIC-IDS2017 (demo replay only)": tied to the file's sha256
+        model = f"Anomaly model: {model_label(MODEL)}"
+        out[1]["note"] = f"{model}. {out[1]['note']}" if out[1]["note"] else model
     return out, error
 
 
@@ -424,9 +427,10 @@ def system_info():
                  ("Pipeline", "newest row", local_time(newest) if newest else "none")]
     except sqlite3.Error:
         rows.append(("Pipeline", "alert rows", "n/a"))
-    # Read-only here; set with `sudo pecan-helper set-anomaly-iface all|eth0|wlan0`.
+    # Read-only here; set with `sudo pecan-helper set-anomaly-iface all|eth0|wlan0|cic0`.
     iface = load_anomaly_iface()
     rows.append(("Pipeline", "anomaly interface", f"{iface} only" if iface else "all"))
+    rows.append(("Pipeline", "anomaly model", model_label(MODEL) or "none"))
     # The pipeline logs Groq's rate-limit headers on every call (needs journal access: group adm).
     line = subprocess.run(["journalctl", "-u", "pecan-pipeline", "--since", "-24h", "--grep", "groq limits",
                            "-n", "1", "-o", "short-iso", "--no-pager", "-q"], capture_output=True, text=True).stdout.strip()

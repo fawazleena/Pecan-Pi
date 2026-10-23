@@ -4,12 +4,13 @@ Usage:
   anomaly.py snapshot --since 2026-10-05 [--until 2026-10-07T18:00] [--out baseline_flows.jsonl] [--iface eth0]
   nice -n 19 anomaly.py train [--baseline baseline_flows.jsonl] [--fp-budget 2.0] [--out anomaly_model.joblib]
   anomaly.py eval FILE [--model anomaly_model.joblib]
+  anomaly.py label MODEL --label TEXT   # sidecar MODEL.meta.json: what the model is (shown in the panel)
   anomaly.py derp-refresh    # update tailscale_derp.json from `tailscale debug derp-map`
 """
 import argparse, glob, gzip, ipaddress, json, math, os, re, subprocess, sys, time
 from collections import Counter, deque
 from datetime import datetime
-from netinfo import load_recon_marker, recon_covers_dest
+from netinfo import load_recon_marker, recon_covers_dest, model_meta_path
 
 EVE = "/var/log/suricata/eve.json"
 BASELINE = "baseline_flows.jsonl"
@@ -238,6 +239,7 @@ class Scorer:
         self.model, self.threshold = b["model"], b["threshold"]
         self.window = SourceWindow(b["window"])
         self.buf = []
+        self.scored = self.flagged = 0   # flows in / flagged by the last flush (pipeline logs them)
 
     def add(self, e):
         if excluded(e):
@@ -256,11 +258,13 @@ class Scorer:
     def flush(self):
         """Score buffered flows in one call; return anomalous flows grouped by source IP
         (the features describe what a source did, so a sweep across many hosts is one group)."""
+        self.scored = self.flagged = 0
         if not self.buf:
             return []
         import numpy as np
         buf, self.buf = self.buf, []
         scores = self.model.score_samples(np.array([v for _, v in buf], dtype=float))
+        self.scored, self.flagged = len(buf), int((scores < self.threshold).sum())
         groups = {}
         for (e, v), sc in zip(buf, scores):
             if sc >= self.threshold:
@@ -377,6 +381,20 @@ def cmd_eval(a):
         print(f"  {g['score']:.3f}  {g['src_ip']} -> {g['dest_ip']}  {'/'.join(g['protos'])}  "
               f"ports {g['dest_ports_sample']}{'...' if g['n_dest_ports'] > 10 else ''}\n         {g['summary']}")
 
+def cmd_label(a):
+    """Write the sidecar the pipeline and panel show next to the model (netinfo.model_label()).
+    It records the model file's sha256, so the label stops counting if the model is replaced."""
+    import hashlib, joblib
+    with open(a.model, "rb") as f:
+        digest = hashlib.sha256(f.read()).hexdigest()
+    b = joblib.load(a.model)
+    meta = {"label": a.label, "sha256": digest, "written": datetime.now().astimezone().isoformat(timespec="seconds"),
+            **{k: b.get(k) for k in ("threshold", "fp_budget", "sklearn", "baseline", "n_fit", "n_calib")}}
+    out = model_meta_path(a.model)
+    with open(out, "w") as f:
+        json.dump(meta, f, indent=1)
+    print(f"wrote {out}: {a.label!r}, sha256 {digest}, threshold {meta['threshold']:.4f}")
+
 def cmd_derp_refresh(a):
     out = subprocess.run(["tailscale", "debug", "derp-map"], capture_output=True, text=True, check=True).stdout
     ips = sorted({str(ipaddress.ip_address(n[k])) for r in json.loads(out)["Regions"].values()
@@ -405,6 +423,10 @@ def main():
     v.add_argument("--model", default=MODEL)
     v.add_argument("--top", type=int, default=10)
     v.set_defaults(func=cmd_eval)
+    lb = sub.add_parser("label", help="write MODEL.meta.json: a label tied to the model file's sha256")
+    lb.add_argument("model")
+    lb.add_argument("--label", required=True)
+    lb.set_defaults(func=cmd_label)
     d = sub.add_parser("derp-refresh", help="update the Tailscale relay allowlist")
     d.add_argument("--out", default=DERP)
     d.set_defaults(func=cmd_derp_refresh)

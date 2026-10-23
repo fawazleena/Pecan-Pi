@@ -13,7 +13,7 @@ commands first print progress lines ("step: rebuilding|testing|reloading") so th
 Validation messages start with the field they are about ("port: ...").
 
     pecan-helper set-switch signatures|anomaly|auto_block|ai on|off
-    pecan-helper set-anomaly-iface all|eth0|wlan0    # interface live anomaly scoring uses
+    pecan-helper set-anomaly-iface all|eth0|wlan0|cic0    # interface live anomaly scoring uses (cic0: demo replay)
     pecan-helper list-add allow|deny IP-or-CIDR [NOTE]
     pecan-helper list-remove allow|deny IP-or-CIDR
     pecan-helper list-blocks            # JSON: the honeypot's current timed blocks
@@ -30,7 +30,7 @@ ETC = "/etc/pecan"
 SETTINGS = ETC + "/settings.json"
 # Same names and defaults as netinfo.SWITCHES / load_settings(); duplicated on purpose (see above).
 SWITCHES = ("signatures", "anomaly", "auto_block", "ai")
-ANOMALY_IFACES = ("all", "eth0", "wlan0")   # netinfo.ANOMALY_IFACES + "all" (no filter)
+ANOMALY_IFACES = ("all", "eth0", "wlan0", "cic0")   # netinfo.ANOMALY_IFACES + "all" (no filter)
 # Same files and format as netinfo.IP_LISTS / load_ip_list(). protected.txt is installed by hand
 # (deploy/pecan-protected.txt) and no command here can change it.
 LISTS = {"allow": ETC + "/allowlist.txt", "deny": ETC + "/denylist.txt", "protected": ETC + "/protected.txt"}

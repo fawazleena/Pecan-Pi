@@ -1,7 +1,8 @@
 import json, os, time
 from datetime import datetime, timezone
 from triage import open_db, collapse, cached, triage_all, UNTRIAGED, SELF_RECON_TAG
-from netinfo import host_ips, load_recon_marker, recon_covers_dest, load_settings, load_anomaly_iface
+from netinfo import (host_ips, load_recon_marker, recon_covers_dest, load_settings, load_anomaly_iface,
+                     model_label, REPLAY_IFACE, REPLAY_TAG)
 
 EVE = "/var/log/suricata/eve.json"
 DB = "pecan.db"
@@ -28,13 +29,13 @@ def flush(pending, anomalies, hits):
         if marker and e.get("src_ip") in ours and recon_covers_dest(marker, e.get("dest_ip", "")):
             sig = SELF_RECON_TAG + sig
         slim.update(detection="signature", sid=key[0], signature=sig,
-                    severity=e["alert"]["severity"], count=count)
+                    severity=e["alert"]["severity"], count=count, replay=e.get("in_iface") == REPLAY_IFACE)
         items.append(slim)
     for g in anomalies:
         items.append({"detection": "anomaly", "signature": g["summary"], "src_ip": g["src_ip"],
                       "dest_ip": g["dest_ip"], "dest_ips": g["dest_ips_sample"], "protos": g["protos"],
                       "dest_ports": g["dest_ports_sample"], "n_dest_ports": g["n_dest_ports"],
-                      "count": g["count"], "score": g["score"],
+                      "count": g["count"], "score": g["score"], "replay": anomaly_iface == REPLAY_IFACE,
                       **{k: g[k] for k in ("src_flows", "src_dest_ports", "src_dest_ips", "src_unanswered")}})
     for src, (h, count) in hits.items():
         items.append({"detection": "honeypot", "signature": f"Honeypot: connection to decoy SSH port {h['dest_port']}",
@@ -50,6 +51,8 @@ def flush(pending, anomalies, hits):
         results.update(triage_all([it for it in items if it["n"] not in results]))
     for it in items:
         verdict, priority, reason = results.get(it["n"], UNTRIAGED if settings["ai"] else AI_OFF)
+        if it.get("replay"):   # CIC-IDS2017 demo traffic on cic0: marked, so it is never read as the Pi's own
+            reason = REPLAY_TAG + reason
         db.execute(
             "INSERT INTO alerts (seen_at, sid, signature, severity, src_ip, dest_ip, count, verdict, priority, reason, "
             "detection, score, n_src, n_dest, group_key, action) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -162,7 +165,7 @@ def apply_settings():
             try:
                 from anomaly import Scorer
                 scorer = Scorer(ANOMALY_MODEL)  # a fresh 60 s source window: no stale state from before
-                print("anomaly detection on")
+                print(f"anomaly detection on, model: {model_label(ANOMALY_MODEL)}")
             except Exception as err:
                 print("anomaly detection off:", err)
         else:
@@ -191,6 +194,8 @@ while True:
     if time.time() - last_flush >= BATCH_SECONDS:
         try:
             anomalies = scorer.flush() if scorer else []
+            if scorer and scorer.scored:
+                print(f"anomaly: scored {scorer.scored} flows ({anomaly_iface or 'all'}), flagged {scorer.flagged}")
         except Exception as err:
             print("anomaly error:", err)
             anomalies = []

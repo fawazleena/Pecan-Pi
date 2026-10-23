@@ -91,7 +91,9 @@ def collapse(items):
         if it["detection"] == "signature":
             # Key on the self-recon tag too, so the Pi's own authorised scan is never merged with
             # (and never lends its [self-recon] tag to) a real attacker hitting the same rule+host.
-            by_sid.setdefault((it["sid"], it["signature"].startswith(SELF_RECON_TAG)), []).append(it)
+            # Same for the demo replay: replayed and real alerts are never merged into one row.
+            by_sid.setdefault((it["sid"], it["signature"].startswith(SELF_RECON_TAG), bool(it.get("replay"))),
+                              []).append(it)
         else:
             out.append(it)
     for group in by_sid.values():
@@ -134,7 +136,7 @@ def last_verdict(db, it, since, until):
     return db.execute(
         "SELECT verdict, priority, reason FROM alerts WHERE detection = 'signature' AND sid = ? "
         f"AND group_key IN ({','.join('?' * len(keys))}) AND seen_at >= ? AND seen_at <= ? "
-        "AND verdict != 'unknown' AND reason NOT LIKE '[cached]%' "
+        "AND verdict != 'unknown' AND reason NOT LIKE '[cached]%' AND reason NOT LIKE '[cic-replay]%' "
         "ORDER BY group_key = ? DESC, seen_at DESC LIMIT 1",
         (it["sid"], *keys, since, until, it["group_key"])).fetchone()
 
@@ -151,7 +153,8 @@ def cached(db, items, now):
     since = (t - timedelta(hours=CACHE_HOURS)).isoformat()
     hits = {}
     for it in items:
-        if it["detection"] != "signature":
+        # Demo replay items (CIC-IDS2017 on cic0) neither use nor feed the cache: always judged fresh.
+        if it["detection"] != "signature" or it.get("replay"):
             continue
         row = last_verdict(db, it, since, now)
         if row:
@@ -164,7 +167,7 @@ def cached(db, items, now):
 
 
 def build_prompt(items):
-    hidden = ("score", "ids", "group_key")
+    hidden = ("score", "ids", "group_key", "replay")   # replay: the AI judges the traffic, not its origin
     return (
         "You are a SOC analyst triaging grouped Suricata alerts.\n" + host_context() + "\n"
         "Suricata severity: 1 = highest, 3 = lowest. 'count' = times seen in this window.\n"

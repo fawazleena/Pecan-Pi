@@ -115,7 +115,12 @@ def load_settings():
 # Suricata's capture interfaces (deploy/override.conf). "anomaly_iface" in settings.json limits
 # live anomaly scoring to one of them, to match a baseline snapshotted with --iface (e.g. a lab
 # SPAN port on eth0). Same values in pecan-helper ("all" = no filter).
-ANOMALY_IFACES = ("eth0", "wlan0")
+# cic0: a dummy interface (no IP, no peer: every frame sent to it is dropped) that only exists
+# while CIC-IDS2017 traffic is replayed into it for the demo (docs/cic-demo.md). Rows from it are
+# tagged REPLAY_TAG, so they are never mistaken for the Pi's own traffic.
+REPLAY_IFACE = "cic0"
+REPLAY_TAG = "[cic-replay] "
+ANOMALY_IFACES = ("eth0", "wlan0", REPLAY_IFACE)
 
 
 def load_anomaly_iface():
@@ -126,6 +131,42 @@ def load_anomaly_iface():
     except (OSError, ValueError, AttributeError):
         return None
     return value if value in ANOMALY_IFACES else None
+
+
+def model_meta_path(model):
+    """The label sidecar next to a model: anomaly_model.joblib -> anomaly_model.meta.json."""
+    return Path(str(model).removesuffix(".joblib") + ".meta.json")
+
+
+_model_hash = {}   # (path, mtime_ns, size) -> sha256: the panel asks every few seconds
+
+
+def model_label(model):
+    """What the installed anomaly model is, in words, or None when there is no model. The label
+    comes from the sidecar written by `anomaly.py label` and counts only while its sha256 matches
+    the model file, so a model replaced without a new sidecar is never shown under the old name."""
+    import hashlib
+    try:
+        st = os.stat(model)
+    except OSError:
+        return None
+    key = (str(model), st.st_mtime_ns, st.st_size)
+    if key not in _model_hash:
+        try:
+            with open(model, "rb") as f:
+                _model_hash.clear()
+                _model_hash[key] = hashlib.sha256(f.read()).hexdigest()
+        except OSError as err:
+            return f"unreadable ({err.strerror})"
+    try:
+        meta = json.loads(model_meta_path(model).read_text())
+    except FileNotFoundError:
+        return "unlabelled"
+    except (OSError, ValueError):
+        return "unknown (label file unreadable)"
+    if not isinstance(meta, dict) or meta.get("sha256") != _model_hash[key]:
+        return "unknown (label does not match the model file)"
+    return str(meta.get("label") or "unlabelled")
 
 
 # --- IP lists (panel) -------------------------------------------------------------------------
