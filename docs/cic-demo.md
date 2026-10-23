@@ -185,13 +185,18 @@ changes stay: without a model and `anomaly_iface=cic0` they change nothing.
 
 ## 2-minute demo script
 
-Before: rehearsal done (DDoS rows already in the feed), panel open in IT mode, two terminals ready.
+Timings from the rehearsal (T0 = replay start): first row (the server's replies, 192.168.10.50 ->
+172.16.0.1) at T0+32 s; first row **from 172.16.0.1** (3,988 flows, 997 ports) at T0+95 s; 11,841 flows at
+T0+155 s; 21,000-23,000 flows per batch from T0+215 s. Rehearsal AI verdicts are not quoted (misattribution
+incident); DDoS is shown by its flow numbers, which don't depend on the AI.
+
+Before: pre-flight done, panel open in IT mode (filter: anomaly), four terminals ready.
 
 | Time | Do | Say |
 |---|---|---|
-| -1:00 | Start `sudo python3 -I cic_replay.py cic/replay/fri_scan.pcap` and the wlan0 `tcpdump` | (warm-up minute, before the advisers' slot) |
-| 0:00 | Panel: "Anomaly model: CIC-IDS2017 (demo replay only)", System card `anomaly interface: cic0 only` | Our hotspot model isn't ready, and a model from another network false-alarmed on 61% of normal traffic. So this is a model of a public lab network, scoring only that lab's recorded traffic, replayed into a sealed virtual interface. Our hotspot is not scored. |
-| 0:30 | Terminal: the wlan0 `tcpdump`, still nothing | The attack traffic never leaves the Pi: the dummy interface drops every packet |
-| 0:50 | Feed: `[cic-replay]` anomaly row from 172.16.0.1 (thousands of ports), AI verdict | The Isolation Forest flags the connect scan; the AI explains it. Scan signatures stay quiet: 172.16.0.1 is a private address, so our HOME_NET counts it as inside (finding 6.4) |
-| 1:30 | IT filter: the DDoS rows from the rehearsal | Honest limit: DDoS ranks well (AUC 0.978) but mostly sits inside the 2% threshold; lowering it would be tuning on the test day |
-| 1:50 | System card: `kernel_drops` unchanged | Suricata kept up the whole time |
+| -0:30 | T4: start the replay (scan, then DDoS) | (before the advisers' slot) |
+| 0:00 | Panel: "Anomaly model: CIC-IDS2017 (demo replay only)" under Spot unusual behaviour; System card `anomaly interface: cic0 only` | Our hotspot model isn't ready, and a model from another network false-alarmed on 61% of normal traffic. So this model learned a public lab network (CIC-IDS2017 Monday), and it scores only that lab's recorded Friday traffic, replayed into a sealed virtual interface. Our hotspot is not scored. |
+| 0:30 | T1/T2: the wlan0/eth0 `tcpdump`, still nothing | The attack traffic never leaves the Pi: the dummy interface drops every frame, and the replayer refuses any real interface |
+| 1:05 | Feed: `[cic-replay]` row from 172.16.0.1, ~1,000 ports, open it | The Isolation Forest flags the port scan; the AI explains it. Scan signatures stay quiet: 172.16.0.1 is a private address, so our HOME_NET counts it as inside (finding 6.4) |
+| 1:30 | (talk) | Rehearsal on the Pi: 100% of 85,192 scan flows flagged, 1.4% of background flows; DDoS only 3.4%: it ranks as unusual (AUC 0.978) but mostly sits inside the 2% threshold, and lowering it would be tuning on the test day |
+| 1:50 | System card: `kernel_drops` 0 | Suricata kept up the whole time; the replay runs at the original speed |
