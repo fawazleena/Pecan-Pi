@@ -9,8 +9,9 @@ never scored by this model.
 ## Safety design
 
 - **`cic0` is a Linux `dummy` interface**: no IP address, no peer, no cable. Its driver drops every
-  frame sent to it. `tcpreplay` writes raw frames to the one device it is given (raw packet
-  sockets bypass routing and nftables), so replayed packets can only go to `cic0`, and nothing
+  frame sent to it. `cic_replay.py` writes raw frames to the one device it is given (raw packet
+  sockets bypass routing and nftables) and refuses any device that is not a `dummy`, so replayed
+  packets can only go to `cic0`, and nothing
   enters the Pi's IP stack (no routing, forwarding or replies). A veth pair was rejected: its peer
   *receives* the frames into the stack, which could route them out of `wlan0` if forwarding were on.
 - Checked during the replay: `tcpdump` on `wlan0`/`eth0` for the CIC addresses (192.168.10.0/24,
@@ -78,14 +79,14 @@ Check: `journalctl -u pecan-pipeline --since -2min | grep switches` shows `anoma
 sudo ip link add cic0 type dummy
 sudo nmcli device set cic0 managed no
 sudo sysctl -w net.ipv6.conf.cic0.disable_ipv6=1
-sudo ip link set cic0 mtu 9000 arp off up
+sudo ip link set cic0 mtu 12000 arp off up      # largest CIC frame is 11,649 B; Suricata reads the MTU at start
 sudo cp -a /etc/suricata/suricata.yaml /etc/suricata/suricata.yaml.pre-cic
 sudo install -o root -g root -m 0644 cic/suricata.yaml.cic-demo /etc/suricata/suricata.yaml
 sudo nice -n 19 suricata -T -c /etc/suricata/suricata.yaml
 vcgencmd get_throttled
 sudo install -o root -g root -m 0644 deploy/cic-demo-suricata.conf /etc/systemd/system/suricata.service.d/zz-cic-demo.conf
 sudo systemctl daemon-reload && sudo systemctl restart suricata
-sudo tcpreplay -i cic0 --limit=200 cic/replay/fri_scan.pcap
+sudo python3 -I cic_replay.py cic/replay/fri_scan.pcap --limit 200
 ```
 `cic/suricata.yaml.cic-demo` (gitignored) = the installed yaml plus one af-packet entry before
 eth0: `interface: cic0`, `cluster-id: 98`, `cluster-type: cluster_flow`, `defrag: yes`, `threads: 1`,
@@ -109,14 +110,23 @@ Check: journal `anomaly detection on, model: CIC-IDS2017 (demo replay only)` and
 
 ### 5. Replay (rehearsal, then the demo)
 
+**Not tcpreplay** (first rehearsal, 2026-10-24 00:17, aborted after 3 s): the CIC capture host coalesced
+packets (GRO/TSO), so frames reach 7,354 B (scan slice; 312 frames over 4 KB) and 11,649 B (DDoS slice;
+22,338 over 4 KB, 3,544 over 9,014 B; 79% of its bytes are in frames over 1514 B). Kali's tcpreplay 4.5.4
+sends through a TX_RING with 4096-byte slots: it truncated the big frames and then jammed
+(`TP_STATUS_WRONG_FORMAT`), with no runtime switch to turn the ring off. Truncating (`--mtu-trunc`) or
+splitting would change the byte/packet counts the model scores (the evaluation read the pcap whole with
+`suricata -r`), so `cic_replay.py` sends every frame whole with one `send()`, at 1x, dummy interfaces
+only. The aborted run left `[cic-replay]` rows 5300-5309 (tail of the -sS scan: 997 ports, malicious/high)
+and `kernel_drops` stayed 0.
+
 Terminal 1 (leak check, must end with `0 packets captured`):
 ```sh
 sudo timeout 700 tcpdump -ni wlan0 -c 5 'net 192.168.10.0/24 or host 172.16.0.1 or net 205.174.165.0/24'
 ```
 Terminal 2:
 ```sh
-sudo tcpreplay -i cic0 --stats=30 cic/replay/fri_scan.pcap
-sudo tcpreplay -i cic0 --stats=30 cic/replay/fri_ddos.pcap
+sudo sh -c 'python3 -I cic_replay.py cic/replay/fri_scan.pcap; python3 -I cic_replay.py cic/replay/fri_ddos.pcap'
 ```
 `kernel_drops` (no sudo): `tail -n 2000 /var/log/suricata/eve.json | grep '"event_type":"stats"' | tail -1 | jq .stats.capture`.
 
@@ -155,7 +165,7 @@ Before: rehearsal done (DDoS rows already in the feed), panel open in IT mode, t
 
 | Time | Do | Say |
 |---|---|---|
-| -1:00 | Start `tcpreplay ... fri_scan.pcap` and the wlan0 `tcpdump` | (warm-up minute, before the advisers' slot) |
+| -1:00 | Start `sudo python3 -I cic_replay.py cic/replay/fri_scan.pcap` and the wlan0 `tcpdump` | (warm-up minute, before the advisers' slot) |
 | 0:00 | Panel: "Anomaly model: CIC-IDS2017 (demo replay only)", System card `anomaly interface: cic0 only` | Our hotspot model isn't ready, and a model from another network false-alarmed on 61% of normal traffic. So this is a model of a public lab network, scoring only that lab's recorded traffic, replayed into a sealed virtual interface. Our hotspot is not scored. |
 | 0:30 | Terminal: the wlan0 `tcpdump`, still nothing | The attack traffic never leaves the Pi: the dummy interface drops every packet |
 | 0:50 | Feed: `[cic-replay]` anomaly row from 172.16.0.1 (thousands of ports), AI verdict | The Isolation Forest flags the connect scan; the AI explains it. Scan signatures stay quiet: 172.16.0.1 is a private address, so our HOME_NET counts it as inside (finding 6.4) |
