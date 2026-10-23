@@ -95,8 +95,15 @@ invalid checksum` 2200074; the CIC evaluation ran `suricata -k none`, so flows m
 cic0 only, wlan0 keeps the default)
 (made by copying the live file and inserting only inside `af-packet:`; check with `diff`).
 Check: `eve.json` has events with `"in_iface":"cic0"`; `kernel_drops` 0 after the restart.
-Not persistent: `cic0` is gone after a reboot, and Suricata is started with `-i cic0`, so after an
-unplanned reboot run the teardown (step 7) straight away.
+Not persistent: `cic0` is gone after a reboot, and Suricata is started with `-i cic0`, so it fails and
+auto-restarts every 5 s, and **wlan0 is not monitored**. Each failed start leaves `/run/suricata.pid`
+behind, so recreating `cic0` alone is not enough (seen 2026-10-24: 115 restarts). After an unplanned
+reboot, either run the teardown (step 7) or keep the demo and recreate `cic0` (the four `ip`/`nmcli`/
+`sysctl` lines above), then:
+```sh
+sudo systemctl stop suricata && sudo rm -f /run/suricata.pid && sudo systemctl start suricata
+until sudo suricatasc -c uptime >/dev/null 2>&1; do sleep 5; done; echo "Suricata up"
+```
 
 ### 4. Pi: install the model (last)
 
@@ -153,11 +160,28 @@ sudo systemctl restart pecan-pipeline        # journal: "anomaly detection off: 
 sudo /usr/local/sbin/pecan-helper set-anomaly-iface all
 sudo rm /etc/systemd/system/suricata.service.d/zz-cic-demo.conf
 sudo cp -a /etc/suricata/suricata.yaml.pre-cic /etc/suricata/suricata.yaml
-sudo systemctl daemon-reload && sudo systemctl restart suricata
+sudo systemctl daemon-reload
+sudo systemctl stop suricata && sudo rm -f /run/suricata.pid && sudo systemctl start suricata   # pidfile: stale after a failed start
+until sudo suricatasc -c uptime >/dev/null 2>&1; do sleep 5; done; echo "Suricata up"
 sudo ip link del cic0
 ```
 Panel: the "Spot unusual behaviour" switch shows "Not available yet" again (no model). The code
 changes stay: without a model and `anomaly_iface=cic0` they change nothing.
+
+## Incidents (2026-10-24)
+
+- **Misattributed AI verdicts.** In the 00:26:34 batch (capture test) the items sent to Groq were n = 0,1,2,3,6
+  (4 and 5 cached); the model answered the replayed Kerberos alert (n=6) as "3", a live STUN row, and the
+  6 h cache spread that reason. 88 live Tailscale rows (ids 5352-5618, 00:26:34-00:51:28; 6 of them
+  suspicious/medium) carried CIC alerts' reasons; 13 replay rows got none (`AI unavailable`). Pre-existing:
+  batch numbers have had gaps since the cache existed; the replay's mixed batches exposed it. Fix (12cb221):
+  `triage.call()` numbers each request 0..k-1 and maps answers back. Repair: backup
+  `pecan.db.bak-20261024-misattributed`; the 89 rows (88 + one correct live row, 5605, caught by the filter)
+  set to `AI unavailable`; `backfill.py` re-filled 88 from the correct pre-replay verdicts (rows 5096-5129)
+  and re-judged 5605. Rehearsal AI verdicts on `[cic-replay]` rows are affected; flow scoring is not.
+- **Hard reset at 00:53:20** (journal stops mid-output, no shutdown, no under-voltage line; light load: pipeline
+  + one `nice 19` stats run; Anker charger). Second unexplained reset after 2026-10-19. Cause unknown; use the
+  official 5.1 V 3 A PSU. Suricata then crash-looped on the missing `cic0` + stale pidfile (above) until 01:07.
 
 ## 2-minute demo script
 
